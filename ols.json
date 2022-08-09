@@ -1,0 +1,16 @@
+{
+    "collections": [
+        {
+            "name": "core",
+            "path": "C:\\Users\\isimo\\.odin\\core"
+        },
+        {
+            "name": "vendor",
+            "path": "C:\\Users\\isimo\\.odin\\vendor"
+        }
+    ],
+    "enable_document_symbols": true,
+    "enable_semantic_tokens": false,
+    "enable_hover": true,
+    "enable_snippets": true
+}
