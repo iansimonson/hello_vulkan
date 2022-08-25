@@ -190,15 +190,20 @@ create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
 		image_count = swapchain_support.capabilities.maxImageCount
 	}
 
-	create_info: vk.SwapchainCreateInfoKHR
-	create_info.sType = .SWAPCHAIN_CREATE_INFO_KHR
-	create_info.surface = app.surface
-	create_info.minImageCount = image_count
-	create_info.imageFormat = surface_format.format
-	create_info.imageColorSpace = surface_format.colorSpace
-	create_info.imageExtent = extent
-	create_info.imageArrayLayers = 1
-	create_info.imageUsage = {.COLOR_ATTACHMENT}
+	create_info := vk.SwapchainCreateInfoKHR{
+	    sType = .SWAPCHAIN_CREATE_INFO_KHR,
+	    surface = app.surface,
+	    minImageCount = image_count,
+	    imageFormat = surface_format.format,
+	    imageColorSpace = surface_format.colorSpace,
+	    imageExtent = extent,
+	    imageArrayLayers = 1,
+	    imageUsage = {.COLOR_ATTACHMENT},
+        preTransform = swapchain_support.capabilities.currentTransform,
+        compositeAlpha = {.OPAQUE},
+        presentMode = present_mode,
+        clipped = true,
+    }
 
 	indices := find_queue_families(app^, app.physical_device)
 	queue_family_indices := [?]u32{indices.graphics_family.(u32), indices.present_family.(u32)}
@@ -210,11 +215,6 @@ create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
 	} else {
 		create_info.imageSharingMode = .EXCLUSIVE
 	}
-
-	create_info.preTransform = swapchain_support.capabilities.currentTransform
-	create_info.compositeAlpha = {.OPAQUE}
-	create_info.presentMode = present_mode
-	create_info.clipped = true
 
 	swap_chain: vk.SwapchainKHR
 	if vk.CreateSwapchainKHR(app.device, &create_info, nil, &swap_chain) != .SUCCESS {
@@ -303,24 +303,24 @@ create_logical_device :: proc(
 
 	for queue_family, _ in queue_set {
 		queue_create_info: vk.DeviceQueueCreateInfo
-		queue_create_info.sType = .DEVICE_QUEUE_CREATE_INFO
-		queue_create_info.queueFamilyIndex = queue_family
-		queue_create_info.queueCount = 1
-		queue_create_info.pQueuePriorities = &queue_priority
-		append(&queue_create_infos, queue_create_info)
+		append(&queue_create_infos, vk.DeviceQueueCreateInfo{
+            sType = .DEVICE_QUEUE_CREATE_INFO,
+            queueFamilyIndex = queue_family,
+            queueCount = 1,
+            pQueuePriorities = &queue_priority,
+        })
 	}
 
 	device_features: vk.PhysicalDeviceFeatures
 
-	create_info: vk.DeviceCreateInfo
-	create_info.sType = .DEVICE_CREATE_INFO
-	create_info.pQueueCreateInfos = raw_data(queue_create_infos)
-	create_info.queueCreateInfoCount = u32(len(queue_create_infos))
-
-	create_info.pEnabledFeatures = &device_features
-
-	create_info.enabledExtensionCount = u32(len(device_extensions))
-	create_info.ppEnabledExtensionNames = raw_data(device_extensions)
+	create_info := vk.DeviceCreateInfo{
+	    sType = .DEVICE_CREATE_INFO,
+	    pQueueCreateInfos = raw_data(queue_create_infos),
+	    queueCreateInfoCount = u32(len(queue_create_infos)),
+	    pEnabledFeatures = &device_features,
+	    enabledExtensionCount = u32(len(device_extensions)),
+	    ppEnabledExtensionNames = raw_data(device_extensions),
+    }
 
 	if enable_validation_layers {
 		create_info.enabledLayerCount = u32(len(validation_layers))
@@ -476,38 +476,41 @@ query_swap_chain_support :: proc(
 
 create_instance :: proc() -> (instance: vk.Instance, ok := true) {
 	// Technically ApplicationInfo is OPTIONAL
-	app_info: vk.ApplicationInfo
-	app_info.sType = .APPLICATION_INFO
-	app_info.pApplicationName = "Hello Triangle"
-	app_info.applicationVersion = vk.MAKE_VERSION(1, 0, 0)
-	app_info.pEngineName = "No Engine"
-	app_info.engineVersion = vk.MAKE_VERSION(1, 0, 0)
-	app_info.apiVersion = vk.API_VERSION_1_0
+	app_info := vk.ApplicationInfo{
+	    sType = .APPLICATION_INFO,
+	    pApplicationName = "Hello Triangle",
+	    applicationVersion = vk.MAKE_VERSION(1, 0, 0),
+	    pEngineName = "No Engine",
+	    engineVersion = vk.MAKE_VERSION(1, 0, 0),
+	    apiVersion = vk.API_VERSION_1_0,
+    }
 
-	// InstanceCreateInfo is REQUIRED
-	create_info: vk.InstanceCreateInfo
-	create_info.sType = .INSTANCE_CREATE_INFO
-	create_info.pApplicationInfo = &app_info
-
-	// specifies required extensions. Vulkan requires
+    // specifies required extensions. Vulkan requires
 	// an extension to interface with windowing system since the
 	// core is platform agnostic
 	// will add the glfw required basics and then any additional
 	// we specify
 	extensions := get_required_extensions()
-	create_info.enabledExtensionCount = u32(len(extensions))
-	create_info.ppEnabledExtensionNames = raw_data(extensions)
+
+	// InstanceCreateInfo is REQUIRED
+	create_info := vk.InstanceCreateInfo{
+	    sType = .INSTANCE_CREATE_INFO,
+	    pApplicationInfo = &app_info,
+	    enabledExtensionCount = u32(len(extensions)),
+	    ppEnabledExtensionNames = raw_data(extensions),
+    }
 
 	if enable_validation_layers && !check_validation_layer_support() {
 		return nil, false
 	}
 
+    debug_info: vk.DebugUtilsMessengerCreateInfoEXT
 	// for now we'll just not enable any validation layers
 	if enable_validation_layers {
 		create_info.enabledLayerCount = u32(len(validation_layers))
 		create_info.ppEnabledLayerNames = raw_data(validation_layers)
 
-		debug_info := create_debug_messenger_info()
+		debug_info = create_debug_messenger_info()
 		create_info.pNext = &debug_info
 	} else {
 		create_info.enabledLayerCount = 0
@@ -526,13 +529,13 @@ Dbg_Result :: enum {
 }
 
 create_debug_messenger_info :: proc() -> vk.DebugUtilsMessengerCreateInfoEXT {
-	create_info: vk.DebugUtilsMessengerCreateInfoEXT
-	create_info.sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT
-	create_info.messageSeverity = {.VERBOSE, .INFO, .WARNING, .ERROR}
-	create_info.messageType = {.GENERAL, .VALIDATION, .PERFORMANCE}
-	create_info.pfnUserCallback = debug_callback
-	create_info.pUserData = context.user_ptr
-	return create_info
+	return vk.DebugUtilsMessengerCreateInfoEXT{
+	    sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+	    messageSeverity = {.VERBOSE, .INFO, .WARNING, .ERROR},
+	    messageType = {.GENERAL, .VALIDATION, .PERFORMANCE},
+	    pfnUserCallback = debug_callback,
+	    pUserData = context.user_ptr,
+    }
 }
 
 create_debug_messenger :: proc(
@@ -541,26 +544,6 @@ create_debug_messenger :: proc(
 	dm: vk.DebugUtilsMessengerEXT,
 	ok: Dbg_Result = .SUCCESS,
 ) {
-
-	// unnecessary we call load for all funcs before this
-	// // Loads the relevant 
-	// vk_create_debug_utils_msgr :: proc(instance: vk.Instance, info: ^vk.DebugUtilsMessengerCreateInfoEXT) -> (dm: vk.DebugUtilsMessengerEXT, ok : Dbg_Result = .SUCCESS) {
-	//     if vk.CreateDebugUtilsMessengerEXT == nil {
-	//         load_create_func := cast(vk.ProcCreateDebugUtilsMessengerEXT)(glfw.GetInstanceProcAddress(instance, "vkCreateDebugUtilsMessengerEXT"))
-	//         if load_create_func == nil {
-	//             ok = .ERROR
-	//             return
-	//         }
-	//         vk.CreateDebugUtilsMessengerEXT = load_create_func
-	//     }
-
-	//     if vk.CreateDebugUtilsMessengerEXT(instance, info, nil, &dm) != .SUCCESS {
-	//         ok = .ERROR
-	//         return
-	//     }
-	//     return
-	// }
-
 	if !enable_validation_layers {
 		ok = .DISABLED
 		return
@@ -584,16 +567,6 @@ destroy_debug_messenger :: proc(
 	}
 
 	vk.DestroyDebugUtilsMessengerEXT(instance, dm, alloc_callback)
-
-	// load_destroy_func := cast(vk.ProcDestroyDebugUtilsMessengerEXT)(glfw.GetInstanceProcAddress(instance, "vkDestroyDebugUtilsMessengerEXT"))
-	// if load_destroy_func != nil {
-	//     vk.DestroyDebugUtilsMessengerEXT = load_destroy_func
-
-	//     vk.DestroyDebugUtilsMessengerEXT(instance, dm, alloc_callback)
-	//     fmt.println("debug messenger destroyed")
-	// } else {
-	//     fmt.println("Could not load function")
-	// }
 }
 
 as_cstr :: proc(d: $T/[]u8) -> cstring {
