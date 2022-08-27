@@ -17,6 +17,9 @@ when ODIN_DEBUG || #config(EnableValidationLayers, false) {
 validation_layers := make_validation_layers()
 device_extensions := make_device_extensions()
 
+fragment_shader :: #load("./shaders/frag.spv")
+vertex_shader :: #load("./shaders/vert.spv")
+
 main :: proc() {
 
 	app := init()
@@ -75,12 +78,59 @@ Hello_Triangle :: struct {
 	swap_chain_image_format: vk.Format,
 	swap_chain_extent:       vk.Extent2D,
 	swap_chain_image_views:  [dynamic]vk.ImageView,
+	swap_chain_frame_buffers: [dynamic]vk.Framebuffer,
+	render_pass: vk.RenderPass,
+	pipeline_layout: vk.PipelineLayout,
+	graphics_pipeline: vk.Pipeline,
+	command_pool: vk.CommandPool,
+	command_buffer: vk.CommandBuffer,
+	image_available_sem: vk.Semaphore,
+	render_finished_sem: vk.Semaphore,
+	inflight_fence: vk.Fence,
+
 }
 
 run :: proc(app: ^Hello_Triangle) {
 	for !glfw.WindowShouldClose(app.window) {
 		glfw.PollEvents()
+		draw_frame(app)
 	}
+}
+
+draw_frame :: proc(app: ^Hello_Triangle) {
+	vk.WaitForFences(app.device, 1, &app.inflight_fence, true, max(u64))
+	vk.ResetFences(app.device, 1, &app.inflight_fence)
+
+	image_index: u32
+	vk.AcquireNextImageKHR(app.device, app.swap_chain, max(u64), app.image_available_sem, {}, &image_index)
+	vk.ResetCommandBuffer(app.command_buffer, {})
+
+	record_command_buffer(app, app.command_buffer, int(image_index))
+
+	dst_stage_mask := [1]vk.PipelineStageFlags{{.COLOR_ATTACHMENT_OUTPUT}}
+	if vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
+		sType = .SUBMIT_INFO,
+		waitSemaphoreCount = 1,
+		pWaitSemaphores = &app.image_available_sem,
+		pWaitDstStageMask = raw_data(dst_stage_mask[:]),
+		commandBufferCount = 1,
+		pCommandBuffers = &app.command_buffer,
+		signalSemaphoreCount = 1,
+		pSignalSemaphores = &app.render_finished_sem,
+	}, app.inflight_fence) != .SUCCESS {
+		panic("failed to submit draw command buffer!")
+	}
+
+	vk.QueuePresentKHR(app.present_queue, &vk.PresentInfoKHR{
+		sType = .PRESENT_INFO_KHR,
+		waitSemaphoreCount = 1,
+		pWaitSemaphores = &app.render_finished_sem,
+		swapchainCount = 1,
+		pSwapchains = &app.swap_chain,
+		pImageIndices = &image_index,
+		pResults = nil,
+	})
+
 }
 
 init :: proc() -> (app: Hello_Triangle) {
@@ -117,6 +167,8 @@ init :: proc() -> (app: Hello_Triangle) {
 		os.exit(1)
 	} else if res != .SUCCESS {
 		fmt.println("Something else happened:", res)
+	} else {
+		app.dbg_msgr = dbg
 	}
 
 	if glfw.CreateWindowSurface(app.instance, app.window, nil, &app.surface) != .SUCCESS {
@@ -124,42 +176,42 @@ init :: proc() -> (app: Hello_Triangle) {
 	}
 
 	app.physical_device = pick_physical_device(app)
-	fmt.println("physical device:", app.physical_device)
-
 	app.device, app.graphics_queue, app.present_queue = create_logical_device(app)
 	app.swap_chain = create_swap_chain(&app)
 
-	fmt.println()
-	fmt.println("graphics queue:", app.graphics_queue, "present_queue:", app.present_queue)
-	fmt.println()
-
 	app.swap_chain_image_views = make([dynamic]vk.ImageView, len(app.swap_chain_images))
 	for image, i in app.swap_chain_images {
-		result := vk.CreateImageView(
-			app.device,
-			&vk.ImageViewCreateInfo{
-				sType = .IMAGE_VIEW_CREATE_INFO,
-				image = image,
-				viewType = .D2,
-				format = app.swap_chain_image_format,
-				components = {r = .IDENTITY, g = .IDENTITY, b = .IDENTITY, a = .IDENTITY},
-				subresourceRange = {
-					aspectMask = {.COLOR},
-					baseMipLevel = 0,
-					levelCount = 1,
-					baseArrayLayer = 0,
-					layerCount = 1,
-				},
-			},
-			nil,
-			&app.swap_chain_image_views[i],
-		)
-
-		if result != .SUCCESS {
+		if result := vk.CreateImageView(
+			   app.device,
+			   &vk.ImageViewCreateInfo{
+				   sType = .IMAGE_VIEW_CREATE_INFO,
+				   image = image,
+				   viewType = .D2,
+				   format = app.swap_chain_image_format,
+				   components = {r = .IDENTITY, g = .IDENTITY, b = .IDENTITY, a = .IDENTITY},
+				   subresourceRange = {
+					   aspectMask = {.COLOR},
+					   baseMipLevel = 0,
+					   levelCount = 1,
+					   baseArrayLayer = 0,
+					   layerCount = 1,
+				   },
+			   },
+			   nil,
+			   &app.swap_chain_image_views[i],
+		   ); result != .SUCCESS {
 			panic("Could not create image view!")
 		}
 	}
 
+	create_render_pass(&app)
+	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(&app)
+
+	app.swap_chain_frame_buffers = create_frame_buffers(&app)
+	app.command_pool = create_command_pool(&app)
+	app.command_buffer = create_command_buffer(&app)
+
+	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
 	return
 }
 
@@ -167,8 +219,8 @@ cleanup :: proc(app: Hello_Triangle) {
 	defer glfw.Terminate()
 	defer glfw.DestroyWindow(app.window)
 	defer vk.DestroyInstance(app.instance, nil)
-	defer vk.DestroyDevice(app.device, nil)
 	defer destroy_debug_messenger(app.instance, app.dbg_msgr, nil)
+	defer vk.DestroyDevice(app.device, nil)
 	defer vk.DestroySurfaceKHR(app.instance, app.surface, nil)
 	defer vk.DestroySwapchainKHR(app.device, app.swap_chain, nil)
 	defer {
@@ -176,6 +228,291 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyImageView(app.device, image_view, nil)
 		}
 	}
+	defer vk.DestroyRenderPass(app.device, app.render_pass, nil)
+	defer vk.DestroyPipelineLayout(app.device, app.pipeline_layout, nil)
+	defer vk.DestroyPipeline(app.device, app.graphics_pipeline, nil)
+	defer {
+		for fb in app.swap_chain_frame_buffers {
+			vk.DestroyFramebuffer(app.device, fb, nil)
+		}
+	}
+	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
+	defer vk.DestroySemaphore(app.device, app.image_available_sem, nil)
+	defer vk.DestroySemaphore(app.device, app.render_finished_sem, nil)
+	defer vk.DestroyFence(app.device, app.inflight_fence, nil)
+}
+
+create_sync_objects :: proc(app: ^Hello_Triangle) -> (ias, rfs: vk.Semaphore, iff: vk.Fence) {
+	s1 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
+		sType = .SEMAPHORE_CREATE_INFO,
+	}, nil, &ias)
+	s2 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
+		sType = .SEMAPHORE_CREATE_INFO,
+	}, nil, &rfs)
+	fen := vk.CreateFence(app.device, &vk.FenceCreateInfo{
+		sType = .FENCE_CREATE_INFO,
+		flags = {.SIGNALED},
+	}, nil, &iff)
+
+	if s1 != .SUCCESS || s2 != .SUCCESS || fen != .SUCCESS {
+		panic("failed to create sync objects")
+	}
+	return
+}
+
+record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, image_index: int) {
+	if vk.BeginCommandBuffer(buffer, &vk.CommandBufferBeginInfo{
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+	}) != .SUCCESS {
+		panic("Could not begin recording command buffer!")
+	}
+	defer {
+		if vk.EndCommandBuffer(buffer) != .SUCCESS {
+			panic("failed to record command buffer!")
+		}
+	}
+
+	vk.CmdBeginRenderPass(buffer, &vk.RenderPassBeginInfo{
+		sType = .RENDER_PASS_BEGIN_INFO,
+		renderPass = app.render_pass,
+		framebuffer = app.swap_chain_frame_buffers[image_index],
+		renderArea = {
+			extent = app.swap_chain_extent,
+		},
+		clearValueCount = 1,
+		pClearValues = &vk.ClearValue{
+			color = {float32 = {0.0, 0.0, 0.0, 1.0,}},
+		},
+	}, .INLINE)
+	defer vk.CmdEndRenderPass(buffer)
+
+	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
+
+	vk.CmdSetViewport(buffer, 0, 1, &vk.Viewport{
+		width = f32(app.swap_chain_extent.width),
+		height = f32(app.swap_chain_extent.height),
+		maxDepth = 1.0,
+	})
+	vk.CmdSetScissor(buffer, 0, 1, &vk.Rect2D{
+		extent = app.swap_chain_extent,
+	})
+	vk.CmdDraw(buffer, 3, 1, 0, 0)
+}
+
+create_command_buffer :: proc(app: ^Hello_Triangle) -> (buffer: vk.CommandBuffer) {
+	if result := vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
+		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool = app.command_pool,
+		level = .PRIMARY,
+		commandBufferCount = 1,
+	}, &buffer); result != .SUCCESS {
+		panic("Failed to create command buffer!")
+	}
+	return
+}
+
+create_command_pool :: proc(app: ^Hello_Triangle) -> (pool: vk.CommandPool) {
+	indices := find_queue_families(app^, app.physical_device)
+
+	if result := vk.CreateCommandPool(app.device, &vk.CommandPoolCreateInfo{
+		sType = .COMMAND_POOL_CREATE_INFO,
+		flags = {.RESET_COMMAND_BUFFER},
+		queueFamilyIndex = indices.graphics_family.(u32),
+	}, nil, &pool); result != .SUCCESS {
+		panic("Failed to create command pool!")
+	}
+	return
+}
+
+create_frame_buffers :: proc(app: ^Hello_Triangle) -> (fb: [dynamic]vk.Framebuffer) {
+	resize(&fb, len(app.swap_chain_image_views))
+	for view, i in app.swap_chain_image_views {
+		attachments := [?]vk.ImageView{view}
+		if result := vk.CreateFramebuffer(app.device, &vk.FramebufferCreateInfo{
+			sType = .FRAMEBUFFER_CREATE_INFO,
+			renderPass = app.render_pass,
+			attachmentCount = 1,
+			pAttachments = raw_data(attachments[:]),
+			width = app.swap_chain_extent.width,
+			height = app.swap_chain_extent.height,
+			layers = 1,
+		}, nil, &fb[i]); result != .SUCCESS {
+			panic("failed to create framebuffer!")
+		}
+	}
+	return
+}
+
+create_render_pass :: proc(app: ^Hello_Triangle) {
+	color_attachment := vk.AttachmentDescription{
+		format = app.swap_chain_image_format,
+		samples = {._1},
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		stencilLoadOp = .DONT_CARE,
+		stencilStoreOp = .DONT_CARE,
+		initialLayout = .UNDEFINED,
+		finalLayout = .PRESENT_SRC_KHR,
+	}
+
+	ca_ref := vk.AttachmentReference{
+		attachment = 0,
+		layout = .ATTACHMENT_OPTIMAL,
+	}
+
+	subpass := vk.SubpassDescription{
+		pipelineBindPoint = .GRAPHICS,
+		colorAttachmentCount = 1,
+		pColorAttachments = &ca_ref,
+	}
+
+	if result := vk.CreateRenderPass(app.device, &vk.RenderPassCreateInfo{
+		sType = .RENDER_PASS_CREATE_INFO,
+		attachmentCount = 1,
+		pAttachments = &color_attachment,
+		subpassCount = 1,
+		pSubpasses = &subpass,
+		dependencyCount = 1,
+		pDependencies = &vk.SubpassDependency{
+			srcSubpass = vk.SUBPASS_EXTERNAL,
+			dstSubpass = 0,
+			srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+			dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+			dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		}
+	}, nil, &app.render_pass); result != .SUCCESS {
+		panic("Could not create render pass")
+	}
+}
+
+create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout, pipeline: vk.Pipeline) {
+	vert_shader_module := create_shader_module(app, vertex_shader)
+	defer vk.DestroyShaderModule(app.device, vert_shader_module, nil)
+	frag_shader_module := create_shader_module(app, fragment_shader)
+	defer vk.DestroyShaderModule(app.device, frag_shader_module, nil)
+
+	shader_stages := [?]vk.PipelineShaderStageCreateInfo{
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.VERTEX},
+			module = vert_shader_module,
+			pName = "main",
+		},
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.FRAGMENT},
+			module = frag_shader_module,
+			pName = "main",
+		},
+	}
+
+	dynamic_states := [?]vk.DynamicState{.VIEWPORT, .SCISSOR}
+	dynamic_state := vk.PipelineDynamicStateCreateInfo {
+		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		dynamicStateCount = u32(len(dynamic_states)),
+		pDynamicStates    = raw_data(dynamic_states[:]),
+	}
+
+	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
+		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	}
+
+	input_assembly_info := vk.PipelineInputAssemblyStateCreateInfo {
+		sType                  = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		topology               = .TRIANGLE_LIST,
+		primitiveRestartEnable = false,
+	}
+
+	viewport := vk.Viewport {
+		width    = f32(app.swap_chain_extent.width),
+		height   = f32(app.swap_chain_extent.height),
+		maxDepth = 1.0,
+	}
+
+	scissor := vk.Rect2D {
+		extent = app.swap_chain_extent,
+	}
+
+	viewport_state := vk.PipelineViewportStateCreateInfo {
+		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		viewportCount = 1,
+		scissorCount  = 1,
+	}
+
+	rasterizer := vk.PipelineRasterizationStateCreateInfo {
+		sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		polygonMode = .FILL,
+		lineWidth = 1.0,
+		cullMode = {.BACK},
+		frontFace = .CLOCKWISE,
+	}
+
+	multisampling := vk.PipelineMultisampleStateCreateInfo {
+		sType = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		rasterizationSamples = {._1},
+		minSampleShading = 1.0,
+	}
+
+	color_blend_attachment := vk.PipelineColorBlendAttachmentState {
+		colorWriteMask = {.R, .G, .B, .A},
+		srcColorBlendFactor = .ONE,
+		dstColorBlendFactor = .ZERO,
+		colorBlendOp = .ADD,
+		srcAlphaBlendFactor = .ONE,
+		dstAlphaBlendFactor = .ZERO,
+		alphaBlendOp = .ADD,
+	}
+
+	color_blending := vk.PipelineColorBlendStateCreateInfo {
+		sType           = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		logicOp         = .COPY,
+		attachmentCount = 1,
+		pAttachments    = &color_blend_attachment,
+	}
+
+	if result := vk.CreatePipelineLayout(app.device, &vk.PipelineLayoutCreateInfo{
+		sType = .PIPELINE_LAYOUT_CREATE_INFO,
+	}, nil, &pl); result != .SUCCESS {
+		panic("failed ot create pipeline layout!")
+	}
+
+	if result := vk.CreateGraphicsPipelines(app.device, {}, 1, &vk.GraphicsPipelineCreateInfo{
+		sType = .GRAPHICS_PIPELINE_CREATE_INFO,
+		stageCount = 2,
+		pStages = raw_data(shader_stages[:]),
+		pVertexInputState = &vertex_input_info,
+		pInputAssemblyState = &input_assembly_info,
+		pViewportState = &viewport_state,
+		pRasterizationState = &rasterizer,
+		pMultisampleState = &multisampling,
+		pColorBlendState = &color_blending,
+		pDynamicState = &dynamic_state,
+		layout = pl,
+		renderPass = app.render_pass,
+		subpass = 0,
+		basePipelineHandle = {},
+		basePipelineIndex = -1,
+	}, nil, &pipeline); result != .SUCCESS {
+		panic("failed to create graphics pipeline")
+	}
+
+	return
+}
+
+create_shader_module :: proc(app: ^Hello_Triangle, code: []byte) -> (sm: vk.ShaderModule) {
+	if result := vk.CreateShaderModule(
+		   app.device,
+		   &vk.ShaderModuleCreateInfo{
+			   sType = .SHADER_MODULE_CREATE_INFO,
+			   codeSize = len(code),
+			   pCode = (^u32)(raw_data(code)),
+		   },
+		   nil,
+		   &sm,
+	   ); result != .SUCCESS {
+		panic("Failed to create shader module")
+	}
+	return
 }
 
 create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
@@ -190,20 +527,20 @@ create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
 		image_count = swapchain_support.capabilities.maxImageCount
 	}
 
-	create_info := vk.SwapchainCreateInfoKHR{
-	    sType = .SWAPCHAIN_CREATE_INFO_KHR,
-	    surface = app.surface,
-	    minImageCount = image_count,
-	    imageFormat = surface_format.format,
-	    imageColorSpace = surface_format.colorSpace,
-	    imageExtent = extent,
-	    imageArrayLayers = 1,
-	    imageUsage = {.COLOR_ATTACHMENT},
-        preTransform = swapchain_support.capabilities.currentTransform,
-        compositeAlpha = {.OPAQUE},
-        presentMode = present_mode,
-        clipped = true,
-    }
+	create_info := vk.SwapchainCreateInfoKHR {
+		sType = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface = app.surface,
+		minImageCount = image_count,
+		imageFormat = surface_format.format,
+		imageColorSpace = surface_format.colorSpace,
+		imageExtent = extent,
+		imageArrayLayers = 1,
+		imageUsage = {.COLOR_ATTACHMENT},
+		preTransform = swapchain_support.capabilities.currentTransform,
+		compositeAlpha = {.OPAQUE},
+		presentMode = present_mode,
+		clipped = true,
+	}
 
 	indices := find_queue_families(app^, app.physical_device)
 	queue_family_indices := [?]u32{indices.graphics_family.(u32), indices.present_family.(u32)}
@@ -303,24 +640,27 @@ create_logical_device :: proc(
 
 	for queue_family, _ in queue_set {
 		queue_create_info: vk.DeviceQueueCreateInfo
-		append(&queue_create_infos, vk.DeviceQueueCreateInfo{
-            sType = .DEVICE_QUEUE_CREATE_INFO,
-            queueFamilyIndex = queue_family,
-            queueCount = 1,
-            pQueuePriorities = &queue_priority,
-        })
+		append(
+			&queue_create_infos,
+			vk.DeviceQueueCreateInfo{
+				sType = .DEVICE_QUEUE_CREATE_INFO,
+				queueFamilyIndex = queue_family,
+				queueCount = 1,
+				pQueuePriorities = &queue_priority,
+			},
+		)
 	}
 
 	device_features: vk.PhysicalDeviceFeatures
 
-	create_info := vk.DeviceCreateInfo{
-	    sType = .DEVICE_CREATE_INFO,
-	    pQueueCreateInfos = raw_data(queue_create_infos),
-	    queueCreateInfoCount = u32(len(queue_create_infos)),
-	    pEnabledFeatures = &device_features,
-	    enabledExtensionCount = u32(len(device_extensions)),
-	    ppEnabledExtensionNames = raw_data(device_extensions),
-    }
+	create_info := vk.DeviceCreateInfo {
+		sType                   = .DEVICE_CREATE_INFO,
+		pQueueCreateInfos       = raw_data(queue_create_infos),
+		queueCreateInfoCount    = u32(len(queue_create_infos)),
+		pEnabledFeatures        = &device_features,
+		enabledExtensionCount   = u32(len(device_extensions)),
+		ppEnabledExtensionNames = raw_data(device_extensions),
+	}
 
 	if enable_validation_layers {
 		create_info.enabledLayerCount = u32(len(validation_layers))
@@ -475,17 +815,21 @@ query_swap_chain_support :: proc(
 }
 
 create_instance :: proc() -> (instance: vk.Instance, ok := true) {
-	// Technically ApplicationInfo is OPTIONAL
-	app_info := vk.ApplicationInfo{
-	    sType = .APPLICATION_INFO,
-	    pApplicationName = "Hello Triangle",
-	    applicationVersion = vk.MAKE_VERSION(1, 0, 0),
-	    pEngineName = "No Engine",
-	    engineVersion = vk.MAKE_VERSION(1, 0, 0),
-	    apiVersion = vk.API_VERSION_1_0,
-    }
+	if enable_validation_layers && !check_validation_layer_support() {
+		return nil, false
+	}
 
-    // specifies required extensions. Vulkan requires
+	// Technically ApplicationInfo is OPTIONAL
+	app_info := vk.ApplicationInfo {
+		sType              = .APPLICATION_INFO,
+		pApplicationName   = "Hello Triangle",
+		applicationVersion = vk.MAKE_VERSION(1, 0, 0),
+		pEngineName        = "No Engine",
+		engineVersion      = vk.MAKE_VERSION(1, 0, 0),
+		apiVersion         = vk.API_VERSION_1_0,
+	}
+
+	// specifies required extensions. Vulkan requires
 	// an extension to interface with windowing system since the
 	// core is platform agnostic
 	// will add the glfw required basics and then any additional
@@ -493,25 +837,20 @@ create_instance :: proc() -> (instance: vk.Instance, ok := true) {
 	extensions := get_required_extensions()
 
 	// InstanceCreateInfo is REQUIRED
-	create_info := vk.InstanceCreateInfo{
-	    sType = .INSTANCE_CREATE_INFO,
-	    pApplicationInfo = &app_info,
-	    enabledExtensionCount = u32(len(extensions)),
-	    ppEnabledExtensionNames = raw_data(extensions),
-    }
-
-	if enable_validation_layers && !check_validation_layer_support() {
-		return nil, false
+	create_info := vk.InstanceCreateInfo {
+		sType                   = .INSTANCE_CREATE_INFO,
+		pApplicationInfo        = &app_info,
+		enabledExtensionCount   = u32(len(extensions)),
+		ppEnabledExtensionNames = raw_data(extensions),
 	}
 
-    debug_info: vk.DebugUtilsMessengerCreateInfoEXT
-	// for now we'll just not enable any validation layers
+	debug_info: vk.DebugUtilsMessengerCreateInfoEXT
 	if enable_validation_layers {
 		create_info.enabledLayerCount = u32(len(validation_layers))
 		create_info.ppEnabledLayerNames = raw_data(validation_layers)
 
-		debug_info = create_debug_messenger_info()
-		create_info.pNext = &debug_info
+		// debug_info = create_debug_messenger_info()
+		// create_info.pNext = &debug_info
 	} else {
 		create_info.enabledLayerCount = 0
 	}
@@ -529,13 +868,15 @@ Dbg_Result :: enum {
 }
 
 create_debug_messenger_info :: proc() -> vk.DebugUtilsMessengerCreateInfoEXT {
-	return vk.DebugUtilsMessengerCreateInfoEXT{
-	    sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-	    messageSeverity = {.VERBOSE, .INFO, .WARNING, .ERROR},
-	    messageType = {.GENERAL, .VALIDATION, .PERFORMANCE},
-	    pfnUserCallback = debug_callback,
-	    pUserData = context.user_ptr,
-    }
+	return(
+		vk.DebugUtilsMessengerCreateInfoEXT{
+			sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+			messageSeverity = {.VERBOSE, .INFO, .WARNING, .ERROR},
+			messageType = {.GENERAL, .VALIDATION, .PERFORMANCE},
+			pfnUserCallback = debug_callback,
+			pUserData = context.user_ptr,
+		} \
+	)
 }
 
 create_debug_messenger :: proc(
