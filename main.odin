@@ -47,13 +47,6 @@ main :: proc() {
 		)
 	}
 
-
-	mat: matrix[4, 4]f32
-	vec: [4]f32
-	test := mat * vec
-
-	fmt.println(test)
-
 	run(&app)
 
 	fmt.println("Exiting...")
@@ -87,7 +80,6 @@ Hello_Triangle :: struct {
 	image_available_sem: vk.Semaphore,
 	render_finished_sem: vk.Semaphore,
 	inflight_fence: vk.Fence,
-
 }
 
 run :: proc(app: ^Hello_Triangle) {
@@ -95,6 +87,8 @@ run :: proc(app: ^Hello_Triangle) {
 		glfw.PollEvents()
 		draw_frame(app)
 	}
+
+	vk.DeviceWaitIdle(app.device)
 }
 
 draw_frame :: proc(app: ^Hello_Triangle) {
@@ -379,7 +373,7 @@ create_render_pass :: proc(app: ^Hello_Triangle) {
 			srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
 			dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
 			dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
-		}
+		},
 	}, nil, &app.render_pass); result != .SUCCESS {
 		panic("Could not create render pass")
 	}
