@@ -190,24 +190,28 @@ create_full_buffer :: proc(app: ^Hello_Triangle) {
 	app.everything_buffer, app.everything_memory = create_buffer(app, total_allocation_size, {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
 }
 
-initialize_vertex_buffer :: proc(app: ^Hello_Triangle) {
+initialize_buffers :: proc(app: ^Hello_Triangle) {
 
-	position_size, color_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors))
-	staging_position_offset, staging_color_offset := 0, position_size
-	staging_memory_size := position_size + color_size
+	position_size, color_size, index_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors)), vk.DeviceSize(size_of(indices[0]) * len(indices))
+	staging_position_offset, staging_color_offset, staging_index_offset := 0, position_size, position_size + color_size
+	staging_memory_size := position_size + color_size + index_size
 
 	staging_buffer, staging_memory := create_buffer(app, staging_memory_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
 
 	staging_data: rawptr // full data
-	position_data, color_data: rawptr // views
+	position_data, color_data, index_data: rawptr // views
 
 	vk.MapMemory(app.device, staging_memory, 0, staging_memory_size, nil, &staging_data)
 	
-	position_data, color_data = rawptr(uintptr(staging_data) + uintptr(staging_position_offset)), rawptr(uintptr(staging_data) + uintptr(staging_color_offset))
+	position_data, color_data, index_data = 
+		rawptr(uintptr(staging_data) + uintptr(staging_position_offset)),
+		rawptr(uintptr(staging_data) + uintptr(staging_color_offset)),
+		rawptr(uintptr(staging_data) + uintptr(staging_index_offset))
 	
 	mem.copy(position_data, raw_data(positions), int(position_size))
 	mem.copy(color_data, raw_data(colors), int(color_size))
+	mem.copy(index_data, raw_data(indices), int(index_size))
 	
 	vk.UnmapMemory(app.device, staging_memory)
 
@@ -222,27 +226,14 @@ initialize_vertex_buffer :: proc(app: ^Hello_Triangle) {
 			srcOffset = vk.DeviceSize(staging_color_offset), 
 			dstOffset = colors_offset,
 		},
-	})
-}
-
-initialize_index_buffer :: proc(app: ^Hello_Triangle) {
-	size := vk.DeviceSize(size_of(indices[0]) * len(indices))
-	staging_buffer, staging_memory := create_buffer(app, size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
-	defer destroy_buffer(app^, staging_buffer, staging_memory)
-
-	data: rawptr
-	vk.MapMemory(app.device, staging_memory, 0, size, nil, &data)
-	mem.copy(data, raw_data(indices), int(size))
-	vk.UnmapMemory(app.device, staging_memory)
-
-	copy_buffer(app, staging_buffer, app.everything_buffer, []vk.BufferCopy{
 		{
-			size = size,
-			srcOffset = 0,
+			size = index_size,
+			srcOffset = vk.DeviceSize(staging_index_offset),
 			dstOffset = indices_offset,
 		},
 	})
 }
+
 
 find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
 	mem_properties: vk.PhysicalDeviceMemoryProperties
@@ -408,8 +399,7 @@ init :: proc() -> (app: Hello_Triangle) {
 	app.command_buffer = create_command_buffer(&app)
 
 	create_full_buffer(&app)
-	initialize_vertex_buffer(&app)
-	initialize_index_buffer(&app)
+	initialize_buffers(&app)
 
 	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
 	return
