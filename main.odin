@@ -4,6 +4,7 @@ import "core:c"
 import "core:fmt"
 import "core:strings"
 import "core:os"
+import "core:mem"
 import rt "core:runtime"
 import "vendor:glfw"
 import vk "vendor:vulkan"
@@ -19,6 +20,21 @@ device_extensions := make_device_extensions()
 
 fragment_shader :: #load("./shaders/frag.spv")
 vertex_shader :: #load("./shaders/vert.spv")
+
+Vec2 :: [2]f32
+Vec3 :: [3]f32
+
+positions := []Vec2{
+	{0.0, -0.5},
+	{0.5, 0.5},
+	{-0.5, 0.5},
+}
+
+colors := []Vec3{
+	{1.0, 0.0, 0.0},
+	{0.0, 1.0, 0.0},
+	{0.0, 0.0, 1.0},
+}
 
 main :: proc() {
 
@@ -62,8 +78,7 @@ Hello_Triangle :: struct {
 	instance:                vk.Instance,
 	physical_device:         vk.PhysicalDevice,
 	device:                  vk.Device,
-	graphics_queue:          vk.Queue,
-	present_queue:           vk.Queue,
+	graphics_queue, present_queue: vk.Queue,
 	dbg_msgr:                vk.DebugUtilsMessengerEXT,
 	surface:                 vk.SurfaceKHR,
 	swap_chain:              vk.SwapchainKHR,
@@ -75,10 +90,11 @@ Hello_Triangle :: struct {
 	render_pass: vk.RenderPass,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
+	position_buffer, color_buffer: vk.Buffer,
+	position_buffer_memory, color_buffer_memory: vk.DeviceMemory,
 	command_pool: vk.CommandPool,
 	command_buffer: vk.CommandBuffer,
-	image_available_sem: vk.Semaphore,
-	render_finished_sem: vk.Semaphore,
+	image_available_sem, render_finished_sem: vk.Semaphore,
 	inflight_fence: vk.Fence,
 }
 
@@ -89,6 +105,113 @@ run :: proc(app: ^Hello_Triangle) {
 	}
 
 	vk.DeviceWaitIdle(app.device)
+}
+
+create_vertex_buffer :: proc(app: ^Hello_Triangle) {
+	positions_buffer_info := vk.BufferCreateInfo{
+		sType = .BUFFER_CREATE_INFO,
+		size = vk.DeviceSize(size_of(Vec2) * len(positions)),
+		usage = {.VERTEX_BUFFER},
+		sharingMode = .EXCLUSIVE,
+	}
+	colors_buffer_info := vk.BufferCreateInfo{
+		sType = .BUFFER_CREATE_INFO,
+		size = vk.DeviceSize(size_of(Vec3) * len(colors)),
+		usage = {.VERTEX_BUFFER},
+		sharingMode = .EXCLUSIVE,
+	}
+
+	if ok := vk.CreateBuffer(app.device, &positions_buffer_info, nil, &app.position_buffer); ok != .SUCCESS {
+		panic("Failed to create positions vertex buffer!")
+	}
+	if ok := vk.CreateBuffer(app.device, &colors_buffer_info, nil, &app.color_buffer); ok != .SUCCESS {
+		panic("Failed to create color vertex buffer!")
+	}
+
+	position_mem_requirements, color_mem_requirements: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(app.device, app.position_buffer, &position_mem_requirements)
+	vk.GetBufferMemoryRequirements(app.device, app.color_buffer, &color_mem_requirements)
+
+	position_alloc_info, color_alloc_info := 
+		vk.MemoryAllocateInfo{
+			sType = .MEMORY_ALLOCATE_INFO,
+			allocationSize = position_mem_requirements.size,
+			memoryTypeIndex = find_memory_type(app, position_mem_requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
+		},
+		vk.MemoryAllocateInfo{
+			sType = .MEMORY_ALLOCATE_INFO,
+			allocationSize = color_mem_requirements.size,
+			memoryTypeIndex = find_memory_type(app, color_mem_requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
+		}
+	
+	if ok := vk.AllocateMemory(app.device, &position_alloc_info, nil, &app.position_buffer_memory); ok != .SUCCESS {
+		panic("failed to allocate position buffer memory!")
+	}
+	if ok := vk.AllocateMemory(app.device, &color_alloc_info, nil, &app.color_buffer_memory); ok != .SUCCESS {
+		panic("failed to allocate color buffer memory!")
+	}
+
+	vk.BindBufferMemory(app.device, app.position_buffer, app.position_buffer_memory, 0)
+	vk.BindBufferMemory(app.device, app.color_buffer, app.color_buffer_memory, 0)
+
+	position_data, color_data: rawptr
+	vk.MapMemory(app.device, app.position_buffer_memory, 0, positions_buffer_info.size, nil, &position_data)
+	vk.MapMemory(app.device, app.color_buffer_memory, 0, colors_buffer_info.size, nil, &color_data)
+
+	mem.copy(position_data, raw_data(positions), int(positions_buffer_info.size))
+	mem.copy(color_data, raw_data(colors), int(colors_buffer_info.size))
+
+	vk.UnmapMemory(app.device, app.position_buffer_memory)
+	vk.UnmapMemory(app.device, app.color_buffer_memory)
+
+}
+
+find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
+	mem_properties: vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(app.physical_device, &mem_properties)
+
+	for i in 0..<mem_properties.memoryTypeCount {
+		if type_filter & (1 << i) != 0 && (mem_properties.memoryTypes[i].propertyFlags & properties == properties) {
+			return i
+		}
+	}
+
+	panic("Failed to find suitable memory type!")
+
+}
+
+get_binding_descriptions :: proc() -> (ret: [2]vk.VertexInputBindingDescription) {
+	position_description := &ret[0]
+	position_description^ = vk.VertexInputBindingDescription{
+		stride = size_of(Vec2),
+		inputRate = .VERTEX,
+	}
+
+	color_description := &ret[1]
+	color_description^ = vk.VertexInputBindingDescription{
+		binding = 1,
+		stride = size_of(Vec3),
+		inputRate = .VERTEX,
+	}
+	return
+}
+
+get_attribute_descriptions :: proc() -> (ret: [2]vk.VertexInputAttributeDescription) {
+	position_attribute, color_attribute := &ret[0], &ret[1]
+
+	position_attribute^ = vk.VertexInputAttributeDescription{
+		binding = 0,
+		location = 0,
+		format = .R32G32_SFLOAT,
+	}
+
+	color_attribute^ = vk.VertexInputAttributeDescription{
+		binding = 1,
+		location = 1,
+		format = .R32G32B32_SFLOAT,
+	}
+
+	return
 }
 
 draw_frame :: proc(app: ^Hello_Triangle) {
@@ -202,6 +325,9 @@ init :: proc() -> (app: Hello_Triangle) {
 	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(&app)
 
 	app.swap_chain_frame_buffers = create_frame_buffers(&app)
+
+	create_vertex_buffer(&app)
+
 	app.command_pool = create_command_pool(&app)
 	app.command_buffer = create_command_buffer(&app)
 
@@ -230,6 +356,10 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyFramebuffer(app.device, fb, nil)
 		}
 	}
+	defer vk.DestroyBuffer(app.device, app.position_buffer, nil)
+	defer vk.DestroyBuffer(app.device, app.color_buffer, nil)
+	defer vk.FreeMemory(app.device, app.position_buffer_memory, nil)
+	defer vk.FreeMemory(app.device, app.color_buffer_memory, nil)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroySemaphore(app.device, app.image_available_sem, nil)
 	defer vk.DestroySemaphore(app.device, app.render_finished_sem, nil)
@@ -280,8 +410,6 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	}, .INLINE)
 	defer vk.CmdEndRenderPass(buffer)
 
-	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
-
 	vk.CmdSetViewport(buffer, 0, 1, &vk.Viewport{
 		width = f32(app.swap_chain_extent.width),
 		height = f32(app.swap_chain_extent.height),
@@ -290,7 +418,14 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	vk.CmdSetScissor(buffer, 0, 1, &vk.Rect2D{
 		extent = app.swap_chain_extent,
 	})
-	vk.CmdDraw(buffer, 3, 1, 0, 0)
+
+
+	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
+	vertex_buffers := []vk.Buffer{app.position_buffer, app.color_buffer}
+	offsets := []vk.DeviceSize{0, 0}
+	vk.CmdBindVertexBuffers(buffer, 0, 2, raw_data(vertex_buffers), raw_data(offsets))	
+	vk.CmdDraw(buffer, u32(len(positions)), 1, 0, 0)
+
 }
 
 create_command_buffer :: proc(app: ^Hello_Triangle) -> (buffer: vk.CommandBuffer) {
@@ -407,8 +542,15 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 		pDynamicStates    = raw_data(dynamic_states[:]),
 	}
 
+	binding_descriptions := get_binding_descriptions()
+	attribute_descriptions := get_attribute_descriptions()
+	
 	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
 		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount = u32(len(binding_descriptions)),
+		vertexAttributeDescriptionCount = u32(len(attribute_descriptions)),
+		pVertexBindingDescriptions = raw_data(binding_descriptions[:]),
+		pVertexAttributeDescriptions = raw_data(attribute_descriptions[:]),
 	}
 
 	input_assembly_info := vk.PipelineInputAssemblyStateCreateInfo {
