@@ -8,6 +8,7 @@ import "core:mem"
 import "core:time"
 import "core:math/linalg"
 import rt "core:runtime"
+import "core:thread"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -51,9 +52,12 @@ colors_offset := vk.DeviceSize(len(positions) * size_of(Vec2))
 indices := []u32{0, 1, 2, 2, 3, 0}
 indices_offset := colors_offset + vk.DeviceSize(len(colors) * size_of(Vec3))
 
+global_app: ^Hello_Triangle
+
 main :: proc() {
 
 	app := init()
+	global_app = &app
 	defer cleanup(app)
 
 	extension_count: u32
@@ -77,6 +81,10 @@ main :: proc() {
 			ext.specVersion,
 		)
 	}
+
+	thread.run(proc(){
+		run_renderer(global_app)
+	})
 
 	run(&app)
 
@@ -120,12 +128,24 @@ Hello_Triangle :: struct {
 	current_frame: u32,
 }
 
+// terrible but works
+should_close: bool = false
+out: bool = false
+
+run_renderer :: proc(app: ^Hello_Triangle) {
+	for !should_close {
+		draw_frame(app)
+	}
+	out = true
+}
+
 run :: proc(app: ^Hello_Triangle) {
 	for !glfw.WindowShouldClose(app.window) {
 		glfw.PollEvents()
-		draw_frame(app)
 	}
+	should_close = true
 
+	for !out {}
 	vk.DeviceWaitIdle(app.device)
 }
 
@@ -421,8 +441,10 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 
 }
 
+global_ctx: rt.Context
+
 init :: proc() -> (app: Hello_Triangle) {
-	global_ctx := context
+	global_ctx = context
 	context.user_ptr = &global_ctx
 
 	glfw.Init()
