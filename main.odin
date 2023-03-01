@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:strings"
 import "core:os"
 import "core:mem"
+import "core:time"
+import "core:math/linalg"
 import rt "core:runtime"
 import "vendor:glfw"
 import vk "vendor:vulkan"
@@ -15,6 +17,7 @@ when ODIN_DEBUG || #config(EnableValidationLayers, false) {
 	enable_validation_layers := false
 }
 
+MAX_FRAMES_IN_FLIGHT :: 2
 validation_layers := make_validation_layers()
 device_extensions := make_device_extensions()
 
@@ -23,6 +26,10 @@ vertex_shader :: #load("./shaders/vert.spv")
 
 Vec2 :: [2]f32
 Vec3 :: [3]f32
+Mat4 :: matrix[4, 4]f32
+UniformBufferObject :: struct {
+	model, view, proj: Mat4,
+}
 
 positions := []Vec2{
 	{-0.5, -0.5},
@@ -96,14 +103,21 @@ Hello_Triangle :: struct {
 	swap_chain_image_views:  [dynamic]vk.ImageView,
 	swap_chain_frame_buffers: [dynamic]vk.Framebuffer,
 	render_pass: vk.RenderPass,
+	descriptor_set_layout: vk.DescriptorSetLayout,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
 	everything_buffer: vk.Buffer,
 	everything_memory: vk.DeviceMemory,
+	uniform_buffers: [MAX_FRAMES_IN_FLIGHT]vk.Buffer,
+	uniform_memories: [MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
+	uniform_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr,
+	descriptor_pool: vk.DescriptorPool,
+	descriptor_sets: [MAX_FRAMES_IN_FLIGHT]vk.DescriptorSet,
 	command_pool: vk.CommandPool,
-	command_buffer: vk.CommandBuffer,
-	image_available_sem, render_finished_sem: vk.Semaphore,
-	inflight_fence: vk.Fence,
+	command_buffers: [MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer,
+	image_available_sems, render_finished_sems: [MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
+	inflight_fences: [MAX_FRAMES_IN_FLIGHT]vk.Fence,
+	current_frame: u32,
 }
 
 run :: proc(app: ^Hello_Triangle) {
@@ -113,6 +127,21 @@ run :: proc(app: ^Hello_Triangle) {
 	}
 
 	vk.DeviceWaitIdle(app.device)
+}
+
+create_descriptor_set_layout :: proc(app: ^Hello_Triangle) {
+	if vk.CreateDescriptorSetLayout(app.device, &vk.DescriptorSetLayoutCreateInfo{
+		sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings = &vk.DescriptorSetLayoutBinding{
+			binding = 0,
+			descriptorType = .UNIFORM_BUFFER,
+			descriptorCount = 1,
+			stageFlags = {.VERTEX},
+		},
+	}, nil, &app.descriptor_set_layout) != .SUCCESS {
+		panic("Failed to create descriptor set layout!")
+	}
 }
 
 create_buffer :: proc(app: ^Hello_Triangle, size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
@@ -234,6 +263,60 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 	})
 }
 
+create_uniform_buffers :: proc(app: ^Hello_Triangle) {
+	buffer_size := vk.DeviceSize(size_of(UniformBufferObject))
+
+	for i in 0..<MAX_FRAMES_IN_FLIGHT {
+		app.uniform_buffers[i], app.uniform_memories[i] = create_buffer(app, buffer_size, {.UNIFORM_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT})
+		vk.MapMemory(app.device, app.uniform_memories[i], 0, buffer_size, nil, &app.uniform_buffers_mapped[i])
+	}
+}
+
+create_descriptor_pool :: proc(app: ^Hello_Triangle) {
+	if vk.CreateDescriptorPool(app.device, &vk.DescriptorPoolCreateInfo{
+		sType = .DESCRIPTOR_POOL_CREATE_INFO,
+		poolSizeCount = 1,
+		pPoolSizes = &vk.DescriptorPoolSize{
+			type = .UNIFORM_BUFFER,
+			descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
+		},
+		maxSets = u32(MAX_FRAMES_IN_FLIGHT),
+	}, nil, &app.descriptor_pool) != .SUCCESS {
+		panic("Failed to create descriptor pool!")
+	}
+}
+
+create_descriptor_sets :: proc(app: ^Hello_Triangle) {
+	layouts := make([dynamic]vk.DescriptorSetLayout, MAX_FRAMES_IN_FLIGHT, context.temp_allocator)
+	layouts[0] = app.descriptor_set_layout
+	layouts[1] = app.descriptor_set_layout
+
+	if vk.AllocateDescriptorSets(app.device, &vk.DescriptorSetAllocateInfo{
+		sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool = app.descriptor_pool,
+		descriptorSetCount = u32(MAX_FRAMES_IN_FLIGHT),
+		pSetLayouts = raw_data(layouts),
+	}, raw_data(app.descriptor_sets[:])) != .SUCCESS {
+		panic("Failed to allocate descriptor sets!")
+	}
+
+	for i in 0..<MAX_FRAMES_IN_FLIGHT {
+		vk.UpdateDescriptorSets(app.device, 1, &vk.WriteDescriptorSet{
+			sType = .WRITE_DESCRIPTOR_SET,
+			dstSet = app.descriptor_sets[i],
+			dstBinding = 0,
+			dstArrayElement = 0,
+			descriptorType = .UNIFORM_BUFFER,
+			descriptorCount = 1,
+			pBufferInfo = &vk.DescriptorBufferInfo{
+				buffer = app.uniform_buffers[i],
+				offset = 0,
+				range = size_of(UniformBufferObject),
+			},
+		}, 0, nil)
+	}
+}
+
 
 find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
 	mem_properties: vk.PhysicalDeviceMemoryProperties
@@ -283,39 +366,58 @@ get_attribute_descriptions :: proc() -> (ret: [2]vk.VertexInputAttributeDescript
 	return
 }
 
+START_TIME := time.now()
+
+update_uniform_buffer :: proc(app: ^Hello_Triangle, current_image: u32) {
+	current_time := time.now()
+	t := time.diff(START_TIME, current_time)
+	ubo := UniformBufferObject{
+		model = linalg.matrix4_rotate(f32(time.duration_seconds(t)) * f32(linalg.radians(90.0)), linalg.Vector3f32{0, 0, 1.0}),
+		view = linalg.matrix4_look_at(linalg.Vector3f32{2.0, 2.0, 2.0}, linalg.Vector3f32{0.0, 0.0, 0.0}, linalg.Vector3f32{0.0, 0.0, 1.0}),
+		proj = linalg.matrix4_perspective(linalg.radians(f32(45.0)), f32(app.swap_chain_extent.width) / f32(app.swap_chain_extent.height), 0.1, 10.0),
+	}
+	ubo.proj[1, 1] *= -1
+	mem.copy(app.uniform_buffers_mapped[current_image], &ubo, size_of(ubo))
+}
+
 draw_frame :: proc(app: ^Hello_Triangle) {
-	vk.WaitForFences(app.device, 1, &app.inflight_fence, true, max(u64))
-	vk.ResetFences(app.device, 1, &app.inflight_fence)
+	vk.WaitForFences(app.device, 1, &app.inflight_fences[app.current_frame], true, max(u64))
+	vk.ResetFences(app.device, 1, &app.inflight_fences[app.current_frame])
 
 	image_index: u32
-	vk.AcquireNextImageKHR(app.device, app.swap_chain, max(u64), app.image_available_sem, {}, &image_index)
-	vk.ResetCommandBuffer(app.command_buffer, {})
+	vk.AcquireNextImageKHR(app.device, app.swap_chain, max(u64), app.image_available_sems[app.current_frame], {}, &image_index)
+	vk.ResetCommandBuffer(app.command_buffers[app.current_frame], {})
 
-	record_command_buffer(app, app.command_buffer, int(image_index))
+	record_command_buffer(app, app.command_buffers[app.current_frame], int(image_index))
 
 	dst_stage_mask := [1]vk.PipelineStageFlags{{.COLOR_ATTACHMENT_OUTPUT}}
+
+	update_uniform_buffer(app, app.current_frame)
+
 	if vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
 		sType = .SUBMIT_INFO,
 		waitSemaphoreCount = 1,
-		pWaitSemaphores = &app.image_available_sem,
+		pWaitSemaphores = &app.image_available_sems[app.current_frame],
 		pWaitDstStageMask = raw_data(dst_stage_mask[:]),
 		commandBufferCount = 1,
-		pCommandBuffers = &app.command_buffer,
+		pCommandBuffers = &app.command_buffers[app.current_frame],
 		signalSemaphoreCount = 1,
-		pSignalSemaphores = &app.render_finished_sem,
-	}, app.inflight_fence) != .SUCCESS {
+		pSignalSemaphores = &app.render_finished_sems[app.current_frame],
+	}, app.inflight_fences[app.current_frame]) != .SUCCESS {
 		panic("failed to submit draw command buffer!")
 	}
 
 	vk.QueuePresentKHR(app.present_queue, &vk.PresentInfoKHR{
 		sType = .PRESENT_INFO_KHR,
 		waitSemaphoreCount = 1,
-		pWaitSemaphores = &app.render_finished_sem,
+		pWaitSemaphores = &app.render_finished_sems[app.current_frame],
 		swapchainCount = 1,
 		pSwapchains = &app.swap_chain,
 		pImageIndices = &image_index,
 		pResults = nil,
 	})
+
+	app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT
 
 }
 
@@ -391,17 +493,21 @@ init :: proc() -> (app: Hello_Triangle) {
 	}
 
 	create_render_pass(&app)
+	create_descriptor_set_layout(&app)
 	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(&app)
 
 	app.swap_chain_frame_buffers = create_frame_buffers(&app)
 
 	app.command_pool = create_command_pool(&app)
-	app.command_buffer = create_command_buffer(&app)
+	create_command_buffers(&app)
 
 	create_full_buffer(&app)
 	initialize_buffers(&app)
+	create_uniform_buffers(&app)
+	create_descriptor_pool(&app)
+	create_descriptor_sets(&app)
 
-	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
+	create_sync_objects(&app)
 	return
 }
 
@@ -420,6 +526,14 @@ cleanup :: proc(app: Hello_Triangle) {
 	}
 	defer vk.DestroyRenderPass(app.device, app.render_pass, nil)
 	defer vk.DestroyPipelineLayout(app.device, app.pipeline_layout, nil)
+	defer vk.DestroyDescriptorSetLayout(app.device, app.descriptor_set_layout, nil)
+	defer {
+		for i in 0..<MAX_FRAMES_IN_FLIGHT {
+			defer vk.DestroyBuffer(app.device, app.uniform_buffers[i], nil)
+			defer vk.FreeMemory(app.device, app.uniform_memories[i], nil)
+			defer vk.UnmapMemory(app.device, app.uniform_memories[i])
+		}
+	}
 	defer vk.DestroyPipeline(app.device, app.graphics_pipeline, nil)
 	defer {
 		for fb in app.swap_chain_frame_buffers {
@@ -428,27 +542,33 @@ cleanup :: proc(app: Hello_Triangle) {
 	}
 	defer destroy_buffer(app, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
-	defer vk.DestroySemaphore(app.device, app.image_available_sem, nil)
-	defer vk.DestroySemaphore(app.device, app.render_finished_sem, nil)
-	defer vk.DestroyFence(app.device, app.inflight_fence, nil)
+	defer vk.DestroyDescriptorPool(app.device, app.descriptor_pool, nil)
+	defer {
+		for i in 0..<MAX_FRAMES_IN_FLIGHT {
+			defer vk.DestroySemaphore(app.device, app.image_available_sems[i], nil)
+			defer vk.DestroySemaphore(app.device, app.render_finished_sems[i], nil)
+			defer vk.DestroyFence(app.device, app.inflight_fences[i], nil)
+		}
+	}
 }
 
-create_sync_objects :: proc(app: ^Hello_Triangle) -> (ias, rfs: vk.Semaphore, iff: vk.Fence) {
-	s1 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
-		sType = .SEMAPHORE_CREATE_INFO,
-	}, nil, &ias)
-	s2 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
-		sType = .SEMAPHORE_CREATE_INFO,
-	}, nil, &rfs)
-	fen := vk.CreateFence(app.device, &vk.FenceCreateInfo{
-		sType = .FENCE_CREATE_INFO,
-		flags = {.SIGNALED},
-	}, nil, &iff)
-
-	if s1 != .SUCCESS || s2 != .SUCCESS || fen != .SUCCESS {
-		panic("failed to create sync objects")
+create_sync_objects :: proc(app: ^Hello_Triangle) {
+	for i in 0..<MAX_FRAMES_IN_FLIGHT {
+		s1 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
+			sType = .SEMAPHORE_CREATE_INFO,
+		}, nil, &app.image_available_sems[i])
+		s2 := vk.CreateSemaphore(app.device, &vk.SemaphoreCreateInfo{
+			sType = .SEMAPHORE_CREATE_INFO,
+		}, nil, &app.render_finished_sems[i])
+		fen := vk.CreateFence(app.device, &vk.FenceCreateInfo{
+			sType = .FENCE_CREATE_INFO,
+			flags = {.SIGNALED},
+		}, nil, &app.inflight_fences[i])
+	
+		if s1 != .SUCCESS || s2 != .SUCCESS || fen != .SUCCESS {
+			panic("failed to create sync objects")
+		}
 	}
-	return
 }
 
 record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, image_index: int) {
@@ -493,17 +613,18 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	index_buffer := app.everything_buffer
 	vk.CmdBindVertexBuffers(buffer, 0, u32(len(vertex_buffers)), raw_data(vertex_buffers), raw_data(offsets))
 	vk.CmdBindIndexBuffer(buffer, index_buffer, indices_offset, .UINT32)
+	vk.CmdBindDescriptorSets(buffer, .GRAPHICS, app.pipeline_layout, 0, 1, &app.descriptor_sets[app.current_frame], 0, nil)
 	vk.CmdDrawIndexed(buffer, u32(len(indices)), 1, 0, 0, 0)
 
 }
 
-create_command_buffer :: proc(app: ^Hello_Triangle) -> (buffer: vk.CommandBuffer) {
+create_command_buffers :: proc(app: ^Hello_Triangle) {
 	if result := vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
 		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
 		commandPool = app.command_pool,
 		level = .PRIMARY,
-		commandBufferCount = 1,
-	}, &buffer); result != .SUCCESS {
+		commandBufferCount = MAX_FRAMES_IN_FLIGHT,
+	}, raw_data(app.command_buffers[:])); result != .SUCCESS {
 		panic("Failed to create command buffer!")
 	}
 	return
@@ -649,7 +770,7 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 		polygonMode = .FILL,
 		lineWidth = 1.0,
 		cullMode = {.BACK},
-		frontFace = .CLOCKWISE,
+		frontFace = .COUNTER_CLOCKWISE,
 	}
 
 	multisampling := vk.PipelineMultisampleStateCreateInfo {
@@ -677,6 +798,8 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 
 	if result := vk.CreatePipelineLayout(app.device, &vk.PipelineLayoutCreateInfo{
 		sType = .PIPELINE_LAYOUT_CREATE_INFO,
+		setLayoutCount = 1,
+		pSetLayouts = &app.descriptor_set_layout,
 	}, nil, &pl); result != .SUCCESS {
 		panic("failed ot create pipeline layout!")
 	}
