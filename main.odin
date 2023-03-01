@@ -28,19 +28,17 @@ positions := []Vec2{
 	{-0.5, -0.5},
 	{0.5, -0.5},
 	{0.5, 0.5},
-	{0.5, 0.5},
 	{-0.5, 0.5},
-	{-0.5, -0.5},
 }
 
 colors := []Vec3{
 	{1.0, 0.0, 0.0},
 	{0.0, 1.0, 0.0},
 	{0.0, 0.0, 1.0},
-	{0.0, 0.0, 1.0},
 	{1.0, 1.0, 1.0},
-	{1.0, 0.0, 0.0},
 }
+
+indices := []u32{0, 1, 2, 2, 3, 0}
 
 main :: proc() {
 
@@ -96,8 +94,8 @@ Hello_Triangle :: struct {
 	render_pass: vk.RenderPass,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
-	position_buffer, color_buffer: vk.Buffer,
-	position_buffer_memory, color_buffer_memory: vk.DeviceMemory,
+	position_buffer, color_buffer, index_buffer: vk.Buffer,
+	position_buffer_memory, color_buffer_memory, index_memory: vk.DeviceMemory,
 	command_pool: vk.CommandPool,
 	command_buffer: vk.CommandBuffer,
 	image_available_sem, render_finished_sem: vk.Semaphore,
@@ -143,6 +141,11 @@ create_buffer :: proc(app: ^Hello_Triangle, size: vk.DeviceSize, usage: vk.Buffe
 	return
 }
 
+destroy_buffer :: proc(app: Hello_Triangle, buffer: vk.Buffer, memory: vk.DeviceMemory) {
+	defer vk.DestroyBuffer(app.device, buffer, nil)
+	defer  vk.FreeMemory(app.device, memory, nil)
+}
+
 copy_buffer :: proc(app: ^Hello_Triangle, src, dest: vk.Buffer, size: vk.DeviceSize) {
 	temp_command_buffer: vk.CommandBuffer
 	vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
@@ -180,12 +183,10 @@ create_vertex_buffer :: proc(app: ^Hello_Triangle) {
 	position_size, color_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors))
 
 	staging_position_buffer, staging_position_memory := create_buffer(app, position_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
-	defer vk.DestroyBuffer(app.device, staging_position_buffer, nil)
-	defer  vk.FreeMemory(app.device, staging_position_memory, nil)
+	defer destroy_buffer(app^, staging_position_buffer, staging_position_memory)
 
 	staging_color_buffer, staging_color_memory := create_buffer(app, color_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
-	defer vk.DestroyBuffer(app.device, staging_color_buffer, nil)
-	defer vk.FreeMemory(app.device, staging_color_memory, nil)
+	defer destroy_buffer(app^, staging_color_buffer, staging_color_memory)
 
 	position_data, color_data: rawptr
 	vk.MapMemory(app.device, staging_position_memory, 0, position_size, nil, &position_data)
@@ -202,6 +203,21 @@ create_vertex_buffer :: proc(app: ^Hello_Triangle) {
 
 	copy_buffer(app, staging_position_buffer, app.position_buffer, position_size)
 	copy_buffer(app, staging_color_buffer, app.color_buffer, color_size)
+}
+
+create_index_buffer :: proc(app: ^Hello_Triangle) {
+	size := vk.DeviceSize(size_of(indices[0]) * len(indices))
+	staging_buffer, staging_memory := create_buffer(app, size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	defer destroy_buffer(app^, staging_buffer, staging_memory)
+
+	data: rawptr
+	vk.MapMemory(app.device, staging_memory, 0, size, nil, &data)
+	mem.copy(data, raw_data(indices), int(size))
+	vk.UnmapMemory(app.device, staging_memory)
+
+	app.index_buffer, app.index_memory = create_buffer(app, size, {.TRANSFER_DST, .INDEX_BUFFER}, {.DEVICE_LOCAL})
+
+	copy_buffer(app, staging_buffer, app.index_buffer, size)
 }
 
 find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
@@ -368,6 +384,7 @@ init :: proc() -> (app: Hello_Triangle) {
 	app.command_buffer = create_command_buffer(&app)
 
 	create_vertex_buffer(&app)
+	create_index_buffer(&app)
 
 	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
 	return
@@ -394,10 +411,9 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyFramebuffer(app.device, fb, nil)
 		}
 	}
-	defer vk.DestroyBuffer(app.device, app.position_buffer, nil)
-	defer vk.DestroyBuffer(app.device, app.color_buffer, nil)
-	defer vk.FreeMemory(app.device, app.position_buffer_memory, nil)
-	defer vk.FreeMemory(app.device, app.color_buffer_memory, nil)
+	defer destroy_buffer(app, app.position_buffer, app.position_buffer_memory)
+	defer destroy_buffer(app, app.color_buffer, app.color_buffer_memory)
+	defer destroy_buffer(app, app.index_buffer, app.index_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroySemaphore(app.device, app.image_available_sem, nil)
 	defer vk.DestroySemaphore(app.device, app.render_finished_sem, nil)
@@ -461,8 +477,9 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
 	vertex_buffers := []vk.Buffer{app.position_buffer, app.color_buffer}
 	offsets := []vk.DeviceSize{0, 0}
-	vk.CmdBindVertexBuffers(buffer, 0, 2, raw_data(vertex_buffers), raw_data(offsets))	
-	vk.CmdDraw(buffer, u32(len(positions)), 1, 0, 0)
+	vk.CmdBindVertexBuffers(buffer, 0, 2, raw_data(vertex_buffers), raw_data(offsets))
+	vk.CmdBindIndexBuffer(buffer, app.index_buffer, 0, .UINT32)
+	vk.CmdDrawIndexed(buffer, u32(len(indices)), 1, 0, 0, 0)
 
 }
 
