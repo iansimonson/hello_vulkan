@@ -30,6 +30,7 @@ positions := []Vec2{
 	{0.5, 0.5},
 	{-0.5, 0.5},
 }
+positions_offset: vk.DeviceSize = 0
 
 colors := []Vec3{
 	{1.0, 0.0, 0.0},
@@ -38,7 +39,10 @@ colors := []Vec3{
 	{1.0, 1.0, 1.0},
 }
 
+colors_offset := vk.DeviceSize(len(positions) * size_of(Vec2))
+
 indices := []u32{0, 1, 2, 2, 3, 0}
+indices_offset := colors_offset + vk.DeviceSize(len(colors) * size_of(Vec3))
 
 main :: proc() {
 
@@ -94,8 +98,8 @@ Hello_Triangle :: struct {
 	render_pass: vk.RenderPass,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
-	position_buffer, color_buffer, index_buffer: vk.Buffer,
-	position_buffer_memory, color_buffer_memory, index_memory: vk.DeviceMemory,
+	everything_buffer: vk.Buffer,
+	everything_memory: vk.DeviceMemory,
 	command_pool: vk.CommandPool,
 	command_buffer: vk.CommandBuffer,
 	image_available_sem, render_finished_sem: vk.Semaphore,
@@ -146,7 +150,11 @@ destroy_buffer :: proc(app: Hello_Triangle, buffer: vk.Buffer, memory: vk.Device
 	defer  vk.FreeMemory(app.device, memory, nil)
 }
 
-copy_buffer :: proc(app: ^Hello_Triangle, src, dest: vk.Buffer, size: vk.DeviceSize) {
+// Generates a CmdCopyBuffer for a single vk.Buffer to a single vk.Buffer. HOWEVER
+// it allows multiple regions within each buffer to be copied from/to
+// e.g. two vertex buffers can be copied into a single staging buffer
+// which is then split out into two regions within a larger gpu local buffer
+copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.BufferCopy) {
 	temp_command_buffer: vk.CommandBuffer
 	vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
 		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
@@ -163,11 +171,7 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dest: vk.Buffer, size: vk.DeviceS
 		})
 		defer vk.EndCommandBuffer(temp_command_buffer)
 
-		vk.CmdCopyBuffer(temp_command_buffer, src, dest, 1, &vk.BufferCopy{
-			srcOffset = 0,
-			dstOffset = 0,
-			size = size,
-		})
+		vk.CmdCopyBuffer(temp_command_buffer, src, dst, u32(len(copy_infos)), raw_data(copy_infos))
 	}
 
 	vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
@@ -178,34 +182,50 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dest: vk.Buffer, size: vk.DeviceS
 	vk.QueueWaitIdle(app.graphics_queue)
 }
 
-create_vertex_buffer :: proc(app: ^Hello_Triangle) {
+create_full_buffer :: proc(app: ^Hello_Triangle) {
+	// this should be fine since they all have the same alignment
+	position_size, color_size, index_size := size_of(Vec2) * len(positions), size_of(Vec3) * len(positions), size_of(u32) * len(indices)
+	total_allocation_size := vk.DeviceSize(position_size + color_size + index_size)
 
-	position_size, color_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors))
-
-	staging_position_buffer, staging_position_memory := create_buffer(app, position_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
-	defer destroy_buffer(app^, staging_position_buffer, staging_position_memory)
-
-	staging_color_buffer, staging_color_memory := create_buffer(app, color_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
-	defer destroy_buffer(app^, staging_color_buffer, staging_color_memory)
-
-	position_data, color_data: rawptr
-	vk.MapMemory(app.device, staging_position_memory, 0, position_size, nil, &position_data)
-	vk.MapMemory(app.device, staging_color_memory, 0, color_size, nil, &color_data)
-
-	mem.copy(position_data, raw_data(positions), int(position_size))
-	mem.copy(color_data, raw_data(colors), int(color_size))
-
-	vk.UnmapMemory(app.device, staging_position_memory)
-	vk.UnmapMemory(app.device, staging_color_memory)
-
-	app.position_buffer, app.position_buffer_memory = create_buffer(app, position_size, {.VERTEX_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
-	app.color_buffer, app.color_buffer_memory = create_buffer(app, color_size, {.VERTEX_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
-
-	copy_buffer(app, staging_position_buffer, app.position_buffer, position_size)
-	copy_buffer(app, staging_color_buffer, app.color_buffer, color_size)
+	app.everything_buffer, app.everything_memory = create_buffer(app, total_allocation_size, {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
 }
 
-create_index_buffer :: proc(app: ^Hello_Triangle) {
+initialize_vertex_buffer :: proc(app: ^Hello_Triangle) {
+
+	position_size, color_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors))
+	staging_position_offset, staging_color_offset := 0, position_size
+	staging_memory_size := position_size + color_size
+
+	staging_buffer, staging_memory := create_buffer(app, staging_memory_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	defer destroy_buffer(app^, staging_buffer, staging_memory)
+
+	staging_data: rawptr // full data
+	position_data, color_data: rawptr // views
+
+	vk.MapMemory(app.device, staging_memory, 0, staging_memory_size, nil, &staging_data)
+	
+	position_data, color_data = rawptr(uintptr(staging_data) + uintptr(staging_position_offset)), rawptr(uintptr(staging_data) + uintptr(staging_color_offset))
+	
+	mem.copy(position_data, raw_data(positions), int(position_size))
+	mem.copy(color_data, raw_data(colors), int(color_size))
+	
+	vk.UnmapMemory(app.device, staging_memory)
+
+	copy_buffer(app, staging_buffer, app.everything_buffer, []vk.BufferCopy{
+		{
+			size = position_size, 
+			srcOffset = vk.DeviceSize(staging_position_offset),
+			dstOffset = positions_offset,
+		},
+		{
+			size = color_size, 
+			srcOffset = vk.DeviceSize(staging_color_offset), 
+			dstOffset = colors_offset,
+		},
+	})
+}
+
+initialize_index_buffer :: proc(app: ^Hello_Triangle) {
 	size := vk.DeviceSize(size_of(indices[0]) * len(indices))
 	staging_buffer, staging_memory := create_buffer(app, size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
@@ -215,9 +235,13 @@ create_index_buffer :: proc(app: ^Hello_Triangle) {
 	mem.copy(data, raw_data(indices), int(size))
 	vk.UnmapMemory(app.device, staging_memory)
 
-	app.index_buffer, app.index_memory = create_buffer(app, size, {.TRANSFER_DST, .INDEX_BUFFER}, {.DEVICE_LOCAL})
-
-	copy_buffer(app, staging_buffer, app.index_buffer, size)
+	copy_buffer(app, staging_buffer, app.everything_buffer, []vk.BufferCopy{
+		{
+			size = size,
+			srcOffset = 0,
+			dstOffset = indices_offset,
+		},
+	})
 }
 
 find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
@@ -383,8 +407,9 @@ init :: proc() -> (app: Hello_Triangle) {
 	app.command_pool = create_command_pool(&app)
 	app.command_buffer = create_command_buffer(&app)
 
-	create_vertex_buffer(&app)
-	create_index_buffer(&app)
+	create_full_buffer(&app)
+	initialize_vertex_buffer(&app)
+	initialize_index_buffer(&app)
 
 	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
 	return
@@ -411,9 +436,7 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyFramebuffer(app.device, fb, nil)
 		}
 	}
-	defer destroy_buffer(app, app.position_buffer, app.position_buffer_memory)
-	defer destroy_buffer(app, app.color_buffer, app.color_buffer_memory)
-	defer destroy_buffer(app, app.index_buffer, app.index_memory)
+	defer destroy_buffer(app, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroySemaphore(app.device, app.image_available_sem, nil)
 	defer vk.DestroySemaphore(app.device, app.render_finished_sem, nil)
@@ -475,10 +498,11 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 
 
 	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
-	vertex_buffers := []vk.Buffer{app.position_buffer, app.color_buffer}
-	offsets := []vk.DeviceSize{0, 0}
-	vk.CmdBindVertexBuffers(buffer, 0, 2, raw_data(vertex_buffers), raw_data(offsets))
-	vk.CmdBindIndexBuffer(buffer, app.index_buffer, 0, .UINT32)
+	vertex_buffers := []vk.Buffer{app.everything_buffer, app.everything_buffer}
+	offsets := []vk.DeviceSize{positions_offset, colors_offset}
+	index_buffer := app.everything_buffer
+	vk.CmdBindVertexBuffers(buffer, 0, u32(len(vertex_buffers)), raw_data(vertex_buffers), raw_data(offsets))
+	vk.CmdBindIndexBuffer(buffer, index_buffer, indices_offset, .UINT32)
 	vk.CmdDrawIndexed(buffer, u32(len(indices)), 1, 0, 0, 0)
 
 }
