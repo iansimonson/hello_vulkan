@@ -107,63 +107,95 @@ run :: proc(app: ^Hello_Triangle) {
 	vk.DeviceWaitIdle(app.device)
 }
 
+create_buffer :: proc(app: ^Hello_Triangle, size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
+	buffer_info := vk.BufferCreateInfo{
+		sType = .BUFFER_CREATE_INFO,
+		size = size,
+		usage = usage,
+		sharingMode = .EXCLUSIVE,
+	}
+
+	if vk.CreateBuffer(app.device, &buffer_info, nil, &buffer) != .SUCCESS {
+		fmt.panicf("Failed to create buffer: {%v, %v, %v}\n", size, usage, properties)
+	}
+
+	mem_requirements: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(app.device, buffer, &mem_requirements)
+
+	alloc_info := vk.MemoryAllocateInfo{
+		sType = .MEMORY_ALLOCATE_INFO,
+		allocationSize = mem_requirements.size,
+		memoryTypeIndex = find_memory_type(app, mem_requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
+	}
+
+	if vk.AllocateMemory(app.device, &alloc_info, nil, &memory) != .SUCCESS {
+		fmt.panicf("failed to allocate memory for the buffer: {%v, %v, %v}\n", size, usage, properties)
+	}
+
+	vk.BindBufferMemory(app.device, buffer, memory, 0)
+
+	return
+}
+
+copy_buffer :: proc(app: ^Hello_Triangle, src, dest: vk.Buffer, size: vk.DeviceSize) {
+	temp_command_buffer: vk.CommandBuffer
+	vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
+		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+		level = .PRIMARY,
+		commandPool = app.command_pool,
+		commandBufferCount = 1,
+	}, &temp_command_buffer)
+	defer vk.FreeCommandBuffers(app.device, app.command_pool, 1, &temp_command_buffer)
+
+	{
+		vk.BeginCommandBuffer(temp_command_buffer, &vk.CommandBufferBeginInfo{
+			sType = .COMMAND_BUFFER_BEGIN_INFO,
+			flags = {.ONE_TIME_SUBMIT},
+		})
+		defer vk.EndCommandBuffer(temp_command_buffer)
+
+		vk.CmdCopyBuffer(temp_command_buffer, src, dest, 1, &vk.BufferCopy{
+			srcOffset = 0,
+			dstOffset = 0,
+			size = size,
+		})
+	}
+
+	vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
+		sType = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers = &temp_command_buffer,
+	}, {})
+	vk.QueueWaitIdle(app.graphics_queue)
+}
+
 create_vertex_buffer :: proc(app: ^Hello_Triangle) {
-	positions_buffer_info := vk.BufferCreateInfo{
-		sType = .BUFFER_CREATE_INFO,
-		size = vk.DeviceSize(size_of(Vec2) * len(positions)),
-		usage = {.VERTEX_BUFFER},
-		sharingMode = .EXCLUSIVE,
-	}
-	colors_buffer_info := vk.BufferCreateInfo{
-		sType = .BUFFER_CREATE_INFO,
-		size = vk.DeviceSize(size_of(Vec3) * len(colors)),
-		usage = {.VERTEX_BUFFER},
-		sharingMode = .EXCLUSIVE,
-	}
 
-	if ok := vk.CreateBuffer(app.device, &positions_buffer_info, nil, &app.position_buffer); ok != .SUCCESS {
-		panic("Failed to create positions vertex buffer!")
-	}
-	if ok := vk.CreateBuffer(app.device, &colors_buffer_info, nil, &app.color_buffer); ok != .SUCCESS {
-		panic("Failed to create color vertex buffer!")
-	}
+	position_size, color_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors))
 
-	position_mem_requirements, color_mem_requirements: vk.MemoryRequirements
-	vk.GetBufferMemoryRequirements(app.device, app.position_buffer, &position_mem_requirements)
-	vk.GetBufferMemoryRequirements(app.device, app.color_buffer, &color_mem_requirements)
+	staging_position_buffer, staging_position_memory := create_buffer(app, position_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	defer vk.DestroyBuffer(app.device, staging_position_buffer, nil)
+	defer  vk.FreeMemory(app.device, staging_position_memory, nil)
 
-	position_alloc_info, color_alloc_info := 
-		vk.MemoryAllocateInfo{
-			sType = .MEMORY_ALLOCATE_INFO,
-			allocationSize = position_mem_requirements.size,
-			memoryTypeIndex = find_memory_type(app, position_mem_requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
-		},
-		vk.MemoryAllocateInfo{
-			sType = .MEMORY_ALLOCATE_INFO,
-			allocationSize = color_mem_requirements.size,
-			memoryTypeIndex = find_memory_type(app, color_mem_requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
-		}
-	
-	if ok := vk.AllocateMemory(app.device, &position_alloc_info, nil, &app.position_buffer_memory); ok != .SUCCESS {
-		panic("failed to allocate position buffer memory!")
-	}
-	if ok := vk.AllocateMemory(app.device, &color_alloc_info, nil, &app.color_buffer_memory); ok != .SUCCESS {
-		panic("failed to allocate color buffer memory!")
-	}
-
-	vk.BindBufferMemory(app.device, app.position_buffer, app.position_buffer_memory, 0)
-	vk.BindBufferMemory(app.device, app.color_buffer, app.color_buffer_memory, 0)
+	staging_color_buffer, staging_color_memory := create_buffer(app, color_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	defer vk.DestroyBuffer(app.device, staging_color_buffer, nil)
+	defer vk.FreeMemory(app.device, staging_color_memory, nil)
 
 	position_data, color_data: rawptr
-	vk.MapMemory(app.device, app.position_buffer_memory, 0, positions_buffer_info.size, nil, &position_data)
-	vk.MapMemory(app.device, app.color_buffer_memory, 0, colors_buffer_info.size, nil, &color_data)
+	vk.MapMemory(app.device, staging_position_memory, 0, position_size, nil, &position_data)
+	vk.MapMemory(app.device, staging_color_memory, 0, color_size, nil, &color_data)
 
-	mem.copy(position_data, raw_data(positions), int(positions_buffer_info.size))
-	mem.copy(color_data, raw_data(colors), int(colors_buffer_info.size))
+	mem.copy(position_data, raw_data(positions), int(position_size))
+	mem.copy(color_data, raw_data(colors), int(color_size))
 
-	vk.UnmapMemory(app.device, app.position_buffer_memory)
-	vk.UnmapMemory(app.device, app.color_buffer_memory)
+	vk.UnmapMemory(app.device, staging_position_memory)
+	vk.UnmapMemory(app.device, staging_color_memory)
 
+	app.position_buffer, app.position_buffer_memory = create_buffer(app, position_size, {.VERTEX_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
+	app.color_buffer, app.color_buffer_memory = create_buffer(app, color_size, {.VERTEX_BUFFER, .TRANSFER_DST}, {.DEVICE_LOCAL})
+
+	copy_buffer(app, staging_position_buffer, app.position_buffer, position_size)
+	copy_buffer(app, staging_color_buffer, app.color_buffer, color_size)
 }
 
 find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
@@ -326,10 +358,10 @@ init :: proc() -> (app: Hello_Triangle) {
 
 	app.swap_chain_frame_buffers = create_frame_buffers(&app)
 
-	create_vertex_buffer(&app)
-
 	app.command_pool = create_command_pool(&app)
 	app.command_buffer = create_command_buffer(&app)
+
+	create_vertex_buffer(&app)
 
 	app.image_available_sem, app.render_finished_sem, app.inflight_fence = create_sync_objects(&app)
 	return
