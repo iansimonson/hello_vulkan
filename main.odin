@@ -10,6 +10,7 @@ import "core:math/linalg"
 import rt "core:runtime"
 import "core:thread"
 import "vendor:glfw"
+import stbi "vendor:stb/image"
 import vk "vendor:vulkan"
 
 when ODIN_DEBUG || #config(EnableValidationLayers, false) {
@@ -114,8 +115,10 @@ Hello_Triangle :: struct {
 	descriptor_set_layout: vk.DescriptorSetLayout,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
-	everything_buffer: vk.Buffer,
-	everything_memory: vk.DeviceMemory,
+	texture_image: vk.Image,
+	texture_memory: vk.DeviceMemory,
+	everything_buffer: vk.Buffer, // positions, colors, indices
+	everything_memory: vk.DeviceMemory, // positions, colors, indicies
 	uniform_buffers: [MAX_FRAMES_IN_FLIGHT]vk.Buffer,
 	uniform_memories: [MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
 	uniform_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr,
@@ -164,6 +167,193 @@ create_descriptor_set_layout :: proc(app: ^Hello_Triangle) {
 	}
 }
 
+// Can be called in a scope to create, submit, and then deallocate a temporary command buffer
+// by calling this proc, begin/end does not need to be called. call begin/end separately if
+// more flexibility required
+@(deferred_in_out = end_single_time_commands)
+scoped_single_time_commands :: proc(app: ^Hello_Triangle) -> vk.CommandBuffer {
+	return begin_single_time_commands(app)
+}
+
+
+// Creates a temporary command buffer for one time submit / oneshot commands
+// to be written to GPU
+begin_single_time_commands :: proc(app: ^Hello_Triangle) -> (buffer: vk.CommandBuffer) {
+	vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
+		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+		level = .PRIMARY,
+		commandPool = app.command_pool,
+		commandBufferCount = 1,
+	}, &buffer)
+
+	vk.BeginCommandBuffer(buffer, &vk.CommandBufferBeginInfo{
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT},
+	})
+	
+	return
+}
+
+// Ends the temporary command buffer and submits the commands
+end_single_time_commands :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer) {
+	buffer := buffer
+
+	vk.EndCommandBuffer(buffer)
+
+	vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
+		sType = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers = &buffer,
+	}, {})
+	vk.QueueWaitIdle(app.graphics_queue)
+
+	vk.FreeCommandBuffers(app.device, app.command_pool, 1, &buffer)
+}
+
+Image :: struct {
+	pixels: []byte,
+	width, height, channels: i32,
+}
+
+load_image :: proc(path: string) -> (ret: Image) {
+	RGB_ALPHA :: 4 // from stb_image.h
+	fname := strings.clone_to_cstring(path, context.temp_allocator)
+	pixels := stbi.load(fname, &ret.width, &ret.height, &ret.channels, RGB_ALPHA)
+	image_size := ret.width * ret.height * 4
+
+	if pixels == nil {
+		panic("Failed to load texture image!")
+	}
+
+	ret.pixels = pixels[:image_size]
+	return
+}
+
+free_image :: proc(image: Image) {
+	stbi.image_free(raw_data(image.pixels))
+}
+
+create_texture_image :: proc(app: ^Hello_Triangle) {
+	image := load_image("textures/texture.jpg")
+	defer free_image(image)
+
+	staging_buffer, staging_memory := create_buffer(app, vk.DeviceSize(len(image.pixels)), {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	defer destroy_buffer(app^, staging_buffer, staging_memory)
+
+	data: rawptr
+	vk.MapMemory(app.device, staging_memory, 0, vk.DeviceSize(len(image.pixels)), nil, &data)
+	mem.copy(data, raw_data(image.pixels), len(image.pixels))
+	vk.UnmapMemory(app.device, staging_memory)
+
+	app.texture_image, app.texture_memory = create_image(app, u32(image.width), u32(image.height), .R8G8B8A8_SRGB, .OPTIMAL, {.TRANSFER_DST, .SAMPLED}, {.DEVICE_LOCAL})
+
+	transition_image_layout(app, app.texture_image, .R8G8B8A8_SRGB, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
+	copy_buffer_to_image(app, staging_buffer, app.texture_image, u32(image.width), u32(image.height))
+	transition_image_layout(app, app.texture_image, .R8G8B8A8_SRGB, .TRANSFER_DST_OPTIMAL, .SHADER_READ_ONLY_OPTIMAL)
+
+}
+
+create_image :: proc(app: ^Hello_Triangle, width, height: u32, format: vk.Format, tiling: vk.ImageTiling, usage: vk.ImageUsageFlags, properties: vk.MemoryPropertyFlags) -> (image: vk.Image, memory: vk.DeviceMemory) {
+	if vk.CreateImage(app.device, &vk.ImageCreateInfo{
+		sType = .IMAGE_CREATE_INFO,
+		imageType = .D2,
+		extent = vk.Extent3D{width = width, height = height, depth = 1},
+		mipLevels = 1,
+		arrayLayers = 1,
+		format = format,
+		tiling = tiling,
+		initialLayout = .UNDEFINED,
+		usage = usage,
+		sharingMode = .EXCLUSIVE,
+		samples = {._1},
+		flags = nil,
+	}, nil, &image) != .SUCCESS {
+		panic("Failed to create image!")
+	}
+
+	mem_requirements: vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(app.device, image, &mem_requirements)
+
+	if vk.AllocateMemory(app.device, &vk.MemoryAllocateInfo{
+		sType = .MEMORY_ALLOCATE_INFO,
+		allocationSize = mem_requirements.size,
+		memoryTypeIndex = find_memory_type(app, mem_requirements.memoryTypeBits, properties),
+	}, nil, &memory) != .SUCCESS {
+		panic("failed to allocate image memory!")
+	}
+
+	vk.BindImageMemory(app.device, image, memory, 0)
+	return
+}
+
+destroy_image :: proc(app: Hello_Triangle, image: vk.Image, image_mem: vk.DeviceMemory) {
+	vk.DestroyImage(app.device, image, nil)
+	vk.FreeMemory(app.device, image_mem, nil)
+}
+
+transition_image_layout :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format, old_layout, new_layout: vk.ImageLayout) {
+	command_buffer := scoped_single_time_commands(app)
+	barrier := vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		oldLayout = old_layout,
+		newLayout = new_layout,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = image,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+		srcAccessMask = nil,
+		dstAccessMask = nil,
+	}
+
+	source_stage, destination_stage: vk.PipelineStageFlags
+
+	if old_layout == .UNDEFINED && new_layout == .TRANSFER_DST_OPTIMAL {
+		barrier.srcAccessMask = nil
+		barrier.dstAccessMask = nil
+		
+		source_stage = {.TOP_OF_PIPE}
+		destination_stage = {.TRANSFER}
+	} else if old_layout == .TRANSFER_DST_OPTIMAL && new_layout == .SHADER_READ_ONLY_OPTIMAL {
+		barrier.srcAccessMask = {.TRANSFER_WRITE}
+		barrier.dstAccessMask = {.SHADER_READ}
+
+		source_stage = {.TRANSFER}
+		destination_stage = {.FRAGMENT_SHADER}
+	} else {
+		panic("unsupported layout transition!")
+	}
+	vk.CmdPipelineBarrier(command_buffer, source_stage, destination_stage, {}, 0, nil, 0, nil, 1, &barrier)
+}
+
+copy_buffer_to_image :: proc(app: ^Hello_Triangle, buffer: vk.Buffer, image: vk.Image, width, height: u32) {
+	command_buffer := scoped_single_time_commands(app)
+
+	region := vk.BufferImageCopy{
+		bufferOffset = 0,
+		bufferRowLength = 0,
+		bufferImageHeight = 0,
+
+		imageSubresource = {
+			aspectMask = {.COLOR},
+			mipLevel = 0,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+
+		imageOffset = {0, 0, 0},
+		imageExtent = {width, height, 1},
+
+	}
+
+	vk.CmdCopyBufferToImage(command_buffer, buffer, image, .TRANSFER_DST_OPTIMAL, 1, &region)
+}
+
 create_buffer :: proc(app: ^Hello_Triangle, size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
 	buffer_info := vk.BufferCreateInfo{
 		sType = .BUFFER_CREATE_INFO,
@@ -204,31 +394,9 @@ destroy_buffer :: proc(app: Hello_Triangle, buffer: vk.Buffer, memory: vk.Device
 // e.g. two vertex buffers can be copied into a single staging buffer
 // which is then split out into two regions within a larger gpu local buffer
 copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.BufferCopy) {
-	temp_command_buffer: vk.CommandBuffer
-	vk.AllocateCommandBuffers(app.device, &vk.CommandBufferAllocateInfo{
-		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
-		level = .PRIMARY,
-		commandPool = app.command_pool,
-		commandBufferCount = 1,
-	}, &temp_command_buffer)
-	defer vk.FreeCommandBuffers(app.device, app.command_pool, 1, &temp_command_buffer)
+	temp_command_buffer := scoped_single_time_commands(app)
 
-	{
-		vk.BeginCommandBuffer(temp_command_buffer, &vk.CommandBufferBeginInfo{
-			sType = .COMMAND_BUFFER_BEGIN_INFO,
-			flags = {.ONE_TIME_SUBMIT},
-		})
-		defer vk.EndCommandBuffer(temp_command_buffer)
-
-		vk.CmdCopyBuffer(temp_command_buffer, src, dst, u32(len(copy_infos)), raw_data(copy_infos))
-	}
-
-	vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
-		sType = .SUBMIT_INFO,
-		commandBufferCount = 1,
-		pCommandBuffers = &temp_command_buffer,
-	}, {})
-	vk.QueueWaitIdle(app.graphics_queue)
+	vk.CmdCopyBuffer(temp_command_buffer, src, dst, u32(len(copy_infos)), raw_data(copy_infos))
 }
 
 create_full_buffer :: proc(app: ^Hello_Triangle) {
@@ -523,6 +691,7 @@ init :: proc() -> (app: Hello_Triangle) {
 	app.command_pool = create_command_pool(&app)
 	create_command_buffers(&app)
 
+	create_texture_image(&app)
 	create_full_buffer(&app)
 	initialize_buffers(&app)
 	create_uniform_buffers(&app)
@@ -562,6 +731,7 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyFramebuffer(app.device, fb, nil)
 		}
 	}
+	defer destroy_image(app, app.texture_image, app.texture_memory)
 	defer destroy_buffer(app, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroyDescriptorPool(app.device, app.descriptor_pool, nil)
