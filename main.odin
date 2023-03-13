@@ -50,8 +50,16 @@ colors := []Vec3{
 
 colors_offset := vk.DeviceSize(len(positions) * size_of(Vec2))
 
+texture_coords := []Vec2{
+	{1.0, 0.0},
+	{0.0, 0.0},
+	{0.0, 1.0},
+	{1.0, 1.0},
+}
+texture_coords_offset := colors_offset + vk.DeviceSize(len(colors) * size_of(Vec3))
+
 indices := []u32{0, 1, 2, 2, 3, 0}
-indices_offset := colors_offset + vk.DeviceSize(len(colors) * size_of(Vec3))
+indices_offset := texture_coords_offset + vk.DeviceSize(len(texture_coords) * size_of(Vec2))
 
 global_app: ^Hello_Triangle
 
@@ -117,6 +125,8 @@ Hello_Triangle :: struct {
 	graphics_pipeline: vk.Pipeline,
 	texture_image: vk.Image,
 	texture_memory: vk.DeviceMemory,
+	texture_image_view: vk.ImageView,
+	texture_sampler: vk.Sampler,
 	everything_buffer: vk.Buffer, // positions, colors, indices
 	everything_memory: vk.DeviceMemory, // positions, colors, indicies
 	uniform_buffers: [MAX_FRAMES_IN_FLIGHT]vk.Buffer,
@@ -153,15 +163,26 @@ run :: proc(app: ^Hello_Triangle) {
 }
 
 create_descriptor_set_layout :: proc(app: ^Hello_Triangle) {
+	ubo_layout_binding := vk.DescriptorSetLayoutBinding{
+		binding = 0,
+		descriptorType = .UNIFORM_BUFFER,
+		descriptorCount = 1,
+		stageFlags = {.VERTEX},
+	}
+
+	sampler_layout_binding := vk.DescriptorSetLayoutBinding{
+		binding = 1,
+		descriptorCount = 1,
+		descriptorType = .COMBINED_IMAGE_SAMPLER,
+		stageFlags = {.FRAGMENT},
+	}
+
+	bindings := []vk.DescriptorSetLayoutBinding{ubo_layout_binding, sampler_layout_binding}
+	
 	if vk.CreateDescriptorSetLayout(app.device, &vk.DescriptorSetLayoutCreateInfo{
 		sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		bindingCount = 1,
-		pBindings = &vk.DescriptorSetLayoutBinding{
-			binding = 0,
-			descriptorType = .UNIFORM_BUFFER,
-			descriptorCount = 1,
-			stageFlags = {.VERTEX},
-		},
+		bindingCount = u32(len(bindings)),
+		pBindings = raw_data(bindings),
 	}, nil, &app.descriptor_set_layout) != .SUCCESS {
 		panic("Failed to create descriptor set layout!")
 	}
@@ -291,6 +312,57 @@ destroy_image :: proc(app: Hello_Triangle, image: vk.Image, image_mem: vk.Device
 	vk.FreeMemory(app.device, image_mem, nil)
 }
 
+create_texture_image_view :: proc(app: ^Hello_Triangle) {
+	app.texture_image_view = create_image_view(app, app.texture_image, .R8G8B8A8_SRGB)
+}
+
+create_image_view :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format) -> (view: vk.ImageView) {
+	if vk.CreateImageView(app.device, &vk.ImageViewCreateInfo{
+		sType = .IMAGE_VIEW_CREATE_INFO,
+		image = image,
+		viewType = .D2,
+		format = format,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}, nil, &view) != .SUCCESS {
+		panic("Failed to create texture image")
+	}
+	return
+}
+
+create_texture_sampler :: proc(app: ^Hello_Triangle) {
+	props: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(app.physical_device, &props)
+	
+	sampler_info := vk.SamplerCreateInfo{
+		sType = .SAMPLER_CREATE_INFO,
+		magFilter = .LINEAR,
+		minFilter = .LINEAR,
+		addressModeU = .REPEAT,
+		addressModeV = .REPEAT,
+		addressModeW = .REPEAT,
+		anisotropyEnable = true,
+		maxAnisotropy = props.limits.maxSamplerAnisotropy,
+		borderColor = .INT_OPAQUE_BLACK,
+		unnormalizedCoordinates = false,
+		compareEnable = false,
+		compareOp = .ALWAYS,
+		mipmapMode = .LINEAR,
+		mipLodBias = 0,
+		minLod = 0,
+		maxLod = 0,
+	}
+
+	if vk.CreateSampler(app.device, &sampler_info, nil, &app.texture_sampler) != .SUCCESS {
+		panic("Failed to create texture sampler!")
+	}
+}
+
 transition_image_layout :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format, old_layout, new_layout: vk.ImageLayout) {
 	command_buffer := scoped_single_time_commands(app)
 	barrier := vk.ImageMemoryBarrier{
@@ -401,34 +473,36 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.
 
 create_full_buffer :: proc(app: ^Hello_Triangle) {
 	// this should be fine since they all have the same alignment
-	position_size, color_size, index_size := size_of(Vec2) * len(positions), size_of(Vec3) * len(positions), size_of(u32) * len(indices)
-	total_allocation_size := vk.DeviceSize(position_size + color_size + index_size)
+	position_size, color_size, index_size, texture_size := size_of(Vec2) * len(positions), size_of(Vec3) * len(positions), size_of(u32) * len(indices), size_of(Vec2) * len(texture_coords)
+	total_allocation_size := vk.DeviceSize(position_size + color_size + index_size + texture_size)
 
 	app.everything_buffer, app.everything_memory = create_buffer(app, total_allocation_size, {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
 }
 
 initialize_buffers :: proc(app: ^Hello_Triangle) {
 
-	position_size, color_size, index_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors)), vk.DeviceSize(size_of(indices[0]) * len(indices))
-	staging_position_offset, staging_color_offset, staging_index_offset := 0, position_size, position_size + color_size
-	staging_memory_size := position_size + color_size + index_size
+	position_size, color_size, index_size, texture_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors)), vk.DeviceSize(size_of(indices[0]) * len(indices)), vk.DeviceSize(size_of(Vec2) * len(texture_coords))
+	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size
+	staging_memory_size := position_size + color_size + texture_size + index_size
 
 	staging_buffer, staging_memory := create_buffer(app, staging_memory_size, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
 
 	staging_data: rawptr // full data
-	position_data, color_data, index_data: rawptr // views
+	position_data, color_data, index_data, texture_data: rawptr // views
 
 	vk.MapMemory(app.device, staging_memory, 0, staging_memory_size, nil, &staging_data)
 	
-	position_data, color_data, index_data = 
+	position_data, color_data, index_data, texture_data = 
 		rawptr(uintptr(staging_data) + uintptr(staging_position_offset)),
 		rawptr(uintptr(staging_data) + uintptr(staging_color_offset)),
-		rawptr(uintptr(staging_data) + uintptr(staging_index_offset))
+		rawptr(uintptr(staging_data) + uintptr(staging_index_offset)),
+		rawptr(uintptr(staging_data) + uintptr(staging_texture_offset))
 	
 	mem.copy(position_data, raw_data(positions), int(position_size))
 	mem.copy(color_data, raw_data(colors), int(color_size))
 	mem.copy(index_data, raw_data(indices), int(index_size))
+	mem.copy(texture_data, raw_data(texture_coords), int(texture_size))
 	
 	vk.UnmapMemory(app.device, staging_memory)
 
@@ -448,6 +522,11 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 			srcOffset = vk.DeviceSize(staging_index_offset),
 			dstOffset = indices_offset,
 		},
+		{
+			size = texture_size,
+			srcOffset = vk.DeviceSize(staging_texture_offset),
+			dstOffset = texture_coords_offset,
+		},
 	})
 }
 
@@ -461,13 +540,22 @@ create_uniform_buffers :: proc(app: ^Hello_Triangle) {
 }
 
 create_descriptor_pool :: proc(app: ^Hello_Triangle) {
-	if vk.CreateDescriptorPool(app.device, &vk.DescriptorPoolCreateInfo{
-		sType = .DESCRIPTOR_POOL_CREATE_INFO,
-		poolSizeCount = 1,
-		pPoolSizes = &vk.DescriptorPoolSize{
+
+	pool_sizes := []vk.DescriptorPoolSize{
+		{
 			type = .UNIFORM_BUFFER,
 			descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
 		},
+		{
+			type = .COMBINED_IMAGE_SAMPLER,
+			descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
+		},
+	}
+
+	if vk.CreateDescriptorPool(app.device, &vk.DescriptorPoolCreateInfo{
+		sType = .DESCRIPTOR_POOL_CREATE_INFO,
+		poolSizeCount = u32(len(pool_sizes)),
+		pPoolSizes = raw_data(pool_sizes),
 		maxSets = u32(MAX_FRAMES_IN_FLIGHT),
 	}, nil, &app.descriptor_pool) != .SUCCESS {
 		panic("Failed to create descriptor pool!")
@@ -489,19 +577,36 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 	}
 
 	for i in 0..<MAX_FRAMES_IN_FLIGHT {
-		vk.UpdateDescriptorSets(app.device, 1, &vk.WriteDescriptorSet{
-			sType = .WRITE_DESCRIPTOR_SET,
-			dstSet = app.descriptor_sets[i],
-			dstBinding = 0,
-			dstArrayElement = 0,
-			descriptorType = .UNIFORM_BUFFER,
-			descriptorCount = 1,
-			pBufferInfo = &vk.DescriptorBufferInfo{
-				buffer = app.uniform_buffers[i],
-				offset = 0,
-				range = size_of(UniformBufferObject),
+
+		descriptor_sets := []vk.WriteDescriptorSet{
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = app.descriptor_sets[i],
+				dstBinding = 0,
+				dstArrayElement = 0,
+				descriptorType = .UNIFORM_BUFFER,
+				descriptorCount = 1,
+				pBufferInfo = &vk.DescriptorBufferInfo{
+					buffer = app.uniform_buffers[i],
+					offset = 0,
+					range = size_of(UniformBufferObject),
+				},
 			},
-		}, 0, nil)
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = app.descriptor_sets[i],
+				dstBinding = 1,
+				dstArrayElement = 0,
+				descriptorType = .COMBINED_IMAGE_SAMPLER,
+				descriptorCount = 1,
+				pImageInfo = &vk.DescriptorImageInfo{
+					imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+					imageView = app.texture_image_view,
+					sampler = app.texture_sampler,
+				},
+			},
+		}
+		vk.UpdateDescriptorSets(app.device, u32(len(descriptor_sets)), raw_data(descriptor_sets), 0, nil)
 	}
 }
 
@@ -520,7 +625,7 @@ find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.
 
 }
 
-get_binding_descriptions :: proc() -> (ret: [2]vk.VertexInputBindingDescription) {
+get_binding_descriptions :: proc() -> (ret: [3]vk.VertexInputBindingDescription) {
 	position_description := &ret[0]
 	position_description^ = vk.VertexInputBindingDescription{
 		stride = size_of(Vec2),
@@ -533,11 +638,19 @@ get_binding_descriptions :: proc() -> (ret: [2]vk.VertexInputBindingDescription)
 		stride = size_of(Vec3),
 		inputRate = .VERTEX,
 	}
+
+	texture_description := &ret[2]
+	texture_description^ = vk.VertexInputBindingDescription{
+		binding = 2,
+		stride = size_of(Vec2),
+		inputRate = .VERTEX,
+	}
+
 	return
 }
 
-get_attribute_descriptions :: proc() -> (ret: [2]vk.VertexInputAttributeDescription) {
-	position_attribute, color_attribute := &ret[0], &ret[1]
+get_attribute_descriptions :: proc() -> (ret: [3]vk.VertexInputAttributeDescription) {
+	position_attribute, color_attribute, texture_attribute := &ret[0], &ret[1], &ret[2]
 
 	position_attribute^ = vk.VertexInputAttributeDescription{
 		binding = 0,
@@ -549,6 +662,12 @@ get_attribute_descriptions :: proc() -> (ret: [2]vk.VertexInputAttributeDescript
 		binding = 1,
 		location = 1,
 		format = .R32G32B32_SFLOAT,
+	}
+
+	texture_attribute^ = vk.VertexInputAttributeDescription{
+		binding = 2,
+		location = 2,
+		format = .R32G32_SFLOAT,
 	}
 
 	return
@@ -659,27 +778,7 @@ init :: proc() -> (app: Hello_Triangle) {
 
 	app.swap_chain_image_views = make([dynamic]vk.ImageView, len(app.swap_chain_images))
 	for image, i in app.swap_chain_images {
-		if result := vk.CreateImageView(
-			   app.device,
-			   &vk.ImageViewCreateInfo{
-				   sType = .IMAGE_VIEW_CREATE_INFO,
-				   image = image,
-				   viewType = .D2,
-				   format = app.swap_chain_image_format,
-				   components = {r = .IDENTITY, g = .IDENTITY, b = .IDENTITY, a = .IDENTITY},
-				   subresourceRange = {
-					   aspectMask = {.COLOR},
-					   baseMipLevel = 0,
-					   levelCount = 1,
-					   baseArrayLayer = 0,
-					   layerCount = 1,
-				   },
-			   },
-			   nil,
-			   &app.swap_chain_image_views[i],
-		   ); result != .SUCCESS {
-			panic("Could not create image view!")
-		}
+		app.swap_chain_image_views[i] = create_image_view(&app, image, app.swap_chain_image_format)
 	}
 
 	create_render_pass(&app)
@@ -692,6 +791,8 @@ init :: proc() -> (app: Hello_Triangle) {
 	create_command_buffers(&app)
 
 	create_texture_image(&app)
+	create_texture_image_view(&app)
+	create_texture_sampler(&app)
 	create_full_buffer(&app)
 	initialize_buffers(&app)
 	create_uniform_buffers(&app)
@@ -732,6 +833,8 @@ cleanup :: proc(app: Hello_Triangle) {
 		}
 	}
 	defer destroy_image(app, app.texture_image, app.texture_memory)
+	defer vk.DestroyImageView(app.device, app.texture_image_view, nil)
+	defer vk.DestroySampler(app.device, app.texture_sampler, nil)
 	defer destroy_buffer(app, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroyDescriptorPool(app.device, app.descriptor_pool, nil)
@@ -800,8 +903,8 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 
 
 	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
-	vertex_buffers := []vk.Buffer{app.everything_buffer, app.everything_buffer}
-	offsets := []vk.DeviceSize{positions_offset, colors_offset}
+	vertex_buffers := []vk.Buffer{app.everything_buffer, app.everything_buffer, app.everything_buffer}
+	offsets := []vk.DeviceSize{positions_offset, colors_offset, texture_coords_offset}
 	index_buffer := app.everything_buffer
 	vk.CmdBindVertexBuffers(buffer, 0, u32(len(vertex_buffers)), raw_data(vertex_buffers), raw_data(offsets))
 	vk.CmdBindIndexBuffer(buffer, index_buffer, indices_offset, .UINT32)
@@ -1172,6 +1275,7 @@ create_logical_device :: proc(
 	}
 
 	device_features: vk.PhysicalDeviceFeatures
+	device_features.samplerAnisotropy = true
 
 	create_info := vk.DeviceCreateInfo {
 		sType                   = .DEVICE_CREATE_INFO,
@@ -1246,7 +1350,8 @@ is_device_suitable :: proc(app: Hello_Triangle, device: vk.PhysicalDevice) -> bo
 		bool(device_features.geometryShader) &&
 		is_complete(indices) &&
 		extensions_supported &&
-		swapchain_adequate \
+		swapchain_adequate &&
+		device_features.samplerAnisotropy \
 	)
 }
 
