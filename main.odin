@@ -6,6 +6,7 @@ import "core:strings"
 import "core:os"
 import "core:mem"
 import "core:time"
+import "core:math"
 import "core:math/linalg"
 import rt "core:runtime"
 import "core:thread"
@@ -33,33 +34,72 @@ UniformBufferObject :: struct {
 	model, view, proj: Mat4,
 }
 
-positions := []Vec2{
-	{-0.5, -0.5},
-	{0.5, -0.5},
-	{0.5, 0.5},
-	{-0.5, 0.5},
+BufferMetaData :: struct {
+	size: vk.DeviceSize,
+	offset: vk.DeviceSize,
+	element_size: vk.DeviceSize,
 }
-positions_offset: vk.DeviceSize = 0
+
+positions := []Vec3{
+	{-0.5, -0.5, 0.0},
+	{0.5, -0.5, 0.0},
+	{0.5, 0.5, 0.0},
+	{-0.5, 0.5, 0.0},
+
+	{-0.5, -0.5, -0.5},
+	{0.5, -0.5, -0.5},
+	{0.5, 0.5, -0.5},
+	{-0.5, 0.5, -0.5},
+}
+positions_md := BufferMetaData{
+	size = vk.DeviceSize(len(positions) * size_of(positions[0])),
+	offset = 0,
+	element_size = size_of(positions[0]),
+}
 
 colors := []Vec3{
 	{1.0, 0.0, 0.0},
 	{0.0, 1.0, 0.0},
 	{0.0, 0.0, 1.0},
 	{1.0, 1.0, 1.0},
-}
 
-colors_offset := vk.DeviceSize(len(positions) * size_of(Vec2))
+	{1.0, 0.0, 0.0},
+	{0.0, 1.0, 0.0},
+	{0.0, 0.0, 1.0},
+	{1.0, 1.0, 1.0},
+}
+colors_md := BufferMetaData{
+	size = vk.DeviceSize(len(colors) * size_of(colors[0])),
+	offset = positions_md.size,
+	element_size = size_of(colors[0]),
+}
 
 texture_coords := []Vec2{
 	{1.0, 0.0},
 	{0.0, 0.0},
 	{0.0, 1.0},
 	{1.0, 1.0},
-}
-texture_coords_offset := colors_offset + vk.DeviceSize(len(colors) * size_of(Vec3))
 
-indices := []u32{0, 1, 2, 2, 3, 0}
-indices_offset := texture_coords_offset + vk.DeviceSize(len(texture_coords) * size_of(Vec2))
+	{1.0, 0.0},
+	{0.0, 0.0},
+	{0.0, 1.0},
+	{1.0, 1.0},
+}
+texture_coords_md := BufferMetaData{
+	size = vk.DeviceSize(len(texture_coords) * size_of(texture_coords[0])),
+	offset = colors_md.offset + colors_md.size,
+	element_size = size_of(texture_coords[0]),
+}
+
+indices := []u32{
+	0, 1, 2, 2, 3, 0,
+	4, 5, 6, 6, 7, 4,
+}
+indices_md := BufferMetaData{
+	size = vk.DeviceSize(len(indices) * size_of(indices[0])),
+	offset = texture_coords_md.offset + texture_coords_md.size,
+	element_size = size_of(indices[0]),
+}
 
 global_app: ^Hello_Triangle
 
@@ -123,9 +163,9 @@ Hello_Triangle :: struct {
 	descriptor_set_layout: vk.DescriptorSetLayout,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
-	texture_image: vk.Image,
-	texture_memory: vk.DeviceMemory,
-	texture_image_view: vk.ImageView,
+	depth_image, texture_image: vk.Image,
+	depth_image_memory, texture_memory: vk.DeviceMemory,
+	depth_image_view, texture_image_view: vk.ImageView,
 	texture_sampler: vk.Sampler,
 	everything_buffer: vk.Buffer, // positions, colors, indices
 	everything_memory: vk.DeviceMemory, // positions, colors, indicies
@@ -231,6 +271,42 @@ end_single_time_commands :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer)
 	vk.FreeCommandBuffers(app.device, app.command_pool, 1, &buffer)
 }
 
+find_supported_format :: proc(app: ^Hello_Triangle, candidates: []vk.Format, tiling: vk.ImageTiling, features: vk.FormatFeatureFlags) -> vk.Format {
+	for candidate in candidates {
+		properties: vk.FormatProperties
+		vk.GetPhysicalDeviceFormatProperties(app.physical_device, candidate, &properties)
+
+		if tiling == .LINEAR && (properties.linearTilingFeatures & features == features) {
+			return candidate
+		} else if tiling == .OPTIMAL && (properties.optimalTilingFeatures & features) == features {
+			return candidate
+		}
+	}
+
+	panic("Could not find any supported format!")
+}
+
+has_stencil_component :: proc(format: vk.Format) -> bool {
+	return format == .D32_SFLOAT_S8_UINT || format == .D24_UNORM_S8_UINT
+}
+
+find_depth_format :: proc(app: ^Hello_Triangle) -> vk.Format {
+	return find_supported_format(app, []vk.Format{
+		.D32_SFLOAT, .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT,
+	}, .OPTIMAL, {.DEPTH_STENCIL_ATTACHMENT})
+}
+
+create_depth_resources :: proc(app: ^Hello_Triangle) {
+	format := find_depth_format(app)
+	app.depth_image, app.depth_image_memory = create_image(app, app.swap_chain_extent.width, app.swap_chain_extent.height, format, .OPTIMAL, {.DEPTH_STENCIL_ATTACHMENT}, {.DEVICE_LOCAL})
+	app.depth_image_view = create_image_view(app, app.depth_image, format, {.DEPTH})
+}
+
+destroy_depth_resources :: proc(app: Hello_Triangle) {
+	defer destroy_image(app, app.depth_image, app.depth_image_memory)
+	defer vk.DestroyImageView(app.device, app.depth_image_view, nil)
+}
+
 Image :: struct {
 	pixels: []byte,
 	width, height, channels: i32,
@@ -313,17 +389,17 @@ destroy_image :: proc(app: Hello_Triangle, image: vk.Image, image_mem: vk.Device
 }
 
 create_texture_image_view :: proc(app: ^Hello_Triangle) {
-	app.texture_image_view = create_image_view(app, app.texture_image, .R8G8B8A8_SRGB)
+	app.texture_image_view = create_image_view(app, app.texture_image, .R8G8B8A8_SRGB, {.COLOR})
 }
 
-create_image_view :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format) -> (view: vk.ImageView) {
+create_image_view :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format, aspect_flags: vk.ImageAspectFlags) -> (view: vk.ImageView) {
 	if vk.CreateImageView(app.device, &vk.ImageViewCreateInfo{
 		sType = .IMAGE_VIEW_CREATE_INFO,
 		image = image,
 		viewType = .D2,
 		format = format,
 		subresourceRange = {
-			aspectMask = {.COLOR},
+			aspectMask = aspect_flags,
 			baseMipLevel = 0,
 			levelCount = 1,
 			baseArrayLayer = 0,
@@ -473,15 +549,19 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.
 
 create_full_buffer :: proc(app: ^Hello_Triangle) {
 	// this should be fine since they all have the same alignment
-	position_size, color_size, index_size, texture_size := size_of(Vec2) * len(positions), size_of(Vec3) * len(positions), size_of(u32) * len(indices), size_of(Vec2) * len(texture_coords)
-	total_allocation_size := vk.DeviceSize(position_size + color_size + index_size + texture_size)
+	position_size, color_size, index_size, texture_size := positions_md.size, colors_md.size, indices_md.size, texture_coords_md.size
+	total_allocation_size := position_size + color_size + index_size + texture_size
 
 	app.everything_buffer, app.everything_memory = create_buffer(app, total_allocation_size, {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
 }
 
+/// Note this is just because we can, but the staging buffer has a layout: positions, colors, indices, texture_coords
+/// but the everything_buffer has a layout: positions, colors, texture_coords, indices
+/// and that works totally fine because we just copy to different offsets in the staging buffer and then just copy
+/// from staging offset to everything buffer offset
 initialize_buffers :: proc(app: ^Hello_Triangle) {
 
-	position_size, color_size, index_size, texture_size := vk.DeviceSize(size_of(Vec2) * len(positions)), vk.DeviceSize(size_of(Vec3) * len(colors)), vk.DeviceSize(size_of(indices[0]) * len(indices)), vk.DeviceSize(size_of(Vec2) * len(texture_coords))
+	position_size, color_size, index_size, texture_size := positions_md.size, colors_md.size, indices_md.size, texture_coords_md.size
 	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size
 	staging_memory_size := position_size + color_size + texture_size + index_size
 
@@ -510,22 +590,22 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 		{
 			size = position_size, 
 			srcOffset = vk.DeviceSize(staging_position_offset),
-			dstOffset = positions_offset,
+			dstOffset = positions_md.offset,
 		},
 		{
 			size = color_size, 
 			srcOffset = vk.DeviceSize(staging_color_offset), 
-			dstOffset = colors_offset,
+			dstOffset = colors_md.offset,
 		},
 		{
 			size = index_size,
 			srcOffset = vk.DeviceSize(staging_index_offset),
-			dstOffset = indices_offset,
+			dstOffset = indices_md.offset,
 		},
 		{
 			size = texture_size,
 			srcOffset = vk.DeviceSize(staging_texture_offset),
-			dstOffset = texture_coords_offset,
+			dstOffset = texture_coords_md.offset,
 		},
 	})
 }
@@ -628,21 +708,21 @@ find_memory_type :: proc(app: ^Hello_Triangle, type_filter: u32, properties: vk.
 get_binding_descriptions :: proc() -> (ret: [3]vk.VertexInputBindingDescription) {
 	position_description := &ret[0]
 	position_description^ = vk.VertexInputBindingDescription{
-		stride = size_of(Vec2),
+		stride = u32(positions_md.element_size),
 		inputRate = .VERTEX,
 	}
 
 	color_description := &ret[1]
 	color_description^ = vk.VertexInputBindingDescription{
 		binding = 1,
-		stride = size_of(Vec3),
+		stride = u32(colors_md.element_size),
 		inputRate = .VERTEX,
 	}
 
 	texture_description := &ret[2]
 	texture_description^ = vk.VertexInputBindingDescription{
 		binding = 2,
-		stride = size_of(Vec2),
+		stride = u32(texture_coords_md.element_size),
 		inputRate = .VERTEX,
 	}
 
@@ -655,7 +735,7 @@ get_attribute_descriptions :: proc() -> (ret: [3]vk.VertexInputAttributeDescript
 	position_attribute^ = vk.VertexInputAttributeDescription{
 		binding = 0,
 		location = 0,
-		format = .R32G32_SFLOAT,
+		format = .R32G32B32_SFLOAT,
 	}
 
 	color_attribute^ = vk.VertexInputAttributeDescription{
@@ -675,13 +755,32 @@ get_attribute_descriptions :: proc() -> (ret: [3]vk.VertexInputAttributeDescript
 
 START_TIME := time.now()
 
+// copy of linalg.matrix4_perspective_f32 but with depth range [0, 1] which is required
+// for vulkan. (as opposed to linalg's [-1, 1] whihc is how GL works)
+matrix4_perspective_f32 :: proc(fovy, aspect, near, far: f32, flip_z_axis := true) -> (m: linalg.Matrix4f32) {
+	tan_half_fovy := math.tan(0.5 * fovy)
+	m[0, 0] = 1 / (aspect*tan_half_fovy)
+	m[1, 1] = 1 / (tan_half_fovy)
+	m[2, 2] = far / (far - near)
+	m[3, 2] = +1
+	m[2, 3] = -(far*near) / (far - near)
+
+	if flip_z_axis {
+		m[2] = -m[2]
+	}
+
+	return
+}
+
+matrix4_perspective :: proc{matrix4_perspective_f32}
+
 update_uniform_buffer :: proc(app: ^Hello_Triangle, current_image: u32) {
 	current_time := time.now()
 	t := time.diff(START_TIME, current_time)
 	ubo := UniformBufferObject{
 		model = linalg.matrix4_rotate(f32(time.duration_seconds(t)) * f32(linalg.radians(90.0)), linalg.Vector3f32{0, 0, 1.0}),
 		view = linalg.matrix4_look_at(linalg.Vector3f32{2.0, 2.0, 2.0}, linalg.Vector3f32{0.0, 0.0, 0.0}, linalg.Vector3f32{0.0, 0.0, 1.0}),
-		proj = linalg.matrix4_perspective(linalg.radians(f32(45.0)), f32(app.swap_chain_extent.width) / f32(app.swap_chain_extent.height), 0.1, 10.0),
+		proj = matrix4_perspective(linalg.radians(f32(45.0)), f32(app.swap_chain_extent.width) / f32(app.swap_chain_extent.height), 0.1, 10.0),
 	}
 	ubo.proj[1, 1] *= -1
 	mem.copy(app.uniform_buffers_mapped[current_image], &ubo, size_of(ubo))
@@ -778,18 +877,19 @@ init :: proc() -> (app: Hello_Triangle) {
 
 	app.swap_chain_image_views = make([dynamic]vk.ImageView, len(app.swap_chain_images))
 	for image, i in app.swap_chain_images {
-		app.swap_chain_image_views[i] = create_image_view(&app, image, app.swap_chain_image_format)
+		app.swap_chain_image_views[i] = create_image_view(&app, image, app.swap_chain_image_format, {.COLOR})
 	}
 
 	create_render_pass(&app)
 	create_descriptor_set_layout(&app)
 	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(&app)
 
-	app.swap_chain_frame_buffers = create_frame_buffers(&app)
-
+	
 	app.command_pool = create_command_pool(&app)
 	create_command_buffers(&app)
-
+	
+	create_depth_resources(&app)
+	app.swap_chain_frame_buffers = create_frame_buffers(&app)
 	create_texture_image(&app)
 	create_texture_image_view(&app)
 	create_texture_sampler(&app)
@@ -832,6 +932,7 @@ cleanup :: proc(app: Hello_Triangle) {
 			vk.DestroyFramebuffer(app.device, fb, nil)
 		}
 	}
+	defer destroy_depth_resources(app)
 	defer destroy_image(app, app.texture_image, app.texture_memory)
 	defer vk.DestroyImageView(app.device, app.texture_image_view, nil)
 	defer vk.DestroySampler(app.device, app.texture_sampler, nil)
@@ -878,6 +979,15 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 		}
 	}
 
+	clear_values := []vk.ClearValue{
+		{
+			color = vk.ClearColorValue{float32 = {0.0, 0.0, 0.0, 1.0}},
+		},
+		{
+			depthStencil = vk.ClearDepthStencilValue{1.0, 0},
+		},
+	}
+
 	vk.CmdBeginRenderPass(buffer, &vk.RenderPassBeginInfo{
 		sType = .RENDER_PASS_BEGIN_INFO,
 		renderPass = app.render_pass,
@@ -885,10 +995,8 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 		renderArea = {
 			extent = app.swap_chain_extent,
 		},
-		clearValueCount = 1,
-		pClearValues = &vk.ClearValue{
-			color = {float32 = {0.0, 0.0, 0.0, 1.0,}},
-		},
+		clearValueCount = u32(len(clear_values)),
+		pClearValues = raw_data(clear_values),
 	}, .INLINE)
 	defer vk.CmdEndRenderPass(buffer)
 
@@ -904,10 +1012,10 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 
 	vk.CmdBindPipeline(buffer, .GRAPHICS, app.graphics_pipeline)
 	vertex_buffers := []vk.Buffer{app.everything_buffer, app.everything_buffer, app.everything_buffer}
-	offsets := []vk.DeviceSize{positions_offset, colors_offset, texture_coords_offset}
+	offsets := []vk.DeviceSize{positions_md.offset, colors_md.offset, texture_coords_md.offset}
 	index_buffer := app.everything_buffer
 	vk.CmdBindVertexBuffers(buffer, 0, u32(len(vertex_buffers)), raw_data(vertex_buffers), raw_data(offsets))
-	vk.CmdBindIndexBuffer(buffer, index_buffer, indices_offset, .UINT32)
+	vk.CmdBindIndexBuffer(buffer, index_buffer, indices_md.offset, .UINT32)
 	vk.CmdBindDescriptorSets(buffer, .GRAPHICS, app.pipeline_layout, 0, 1, &app.descriptor_sets[app.current_frame], 0, nil)
 	vk.CmdDrawIndexed(buffer, u32(len(indices)), 1, 0, 0, 0)
 
@@ -941,11 +1049,11 @@ create_command_pool :: proc(app: ^Hello_Triangle) -> (pool: vk.CommandPool) {
 create_frame_buffers :: proc(app: ^Hello_Triangle) -> (fb: [dynamic]vk.Framebuffer) {
 	resize(&fb, len(app.swap_chain_image_views))
 	for view, i in app.swap_chain_image_views {
-		attachments := [?]vk.ImageView{view}
+		attachments := [?]vk.ImageView{view, app.depth_image_view}
 		if result := vk.CreateFramebuffer(app.device, &vk.FramebufferCreateInfo{
 			sType = .FRAMEBUFFER_CREATE_INFO,
 			renderPass = app.render_pass,
-			attachmentCount = 1,
+			attachmentCount = u32(len(attachments)),
 			pAttachments = raw_data(attachments[:]),
 			width = app.swap_chain_extent.width,
 			height = app.swap_chain_extent.height,
@@ -969,30 +1077,49 @@ create_render_pass :: proc(app: ^Hello_Triangle) {
 		finalLayout = .PRESENT_SRC_KHR,
 	}
 
+	depth_attachment := vk.AttachmentDescription{
+		format = find_depth_format(app),
+		samples = {._1},
+		loadOp = .CLEAR,
+		storeOp = .DONT_CARE,
+		stencilLoadOp = .DONT_CARE,
+		stencilStoreOp = .DONT_CARE,
+		initialLayout = .UNDEFINED,
+		finalLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+	}
+
 	ca_ref := vk.AttachmentReference{
 		attachment = 0,
 		layout = .ATTACHMENT_OPTIMAL,
+	}
+
+	depth_ref := vk.AttachmentReference{
+		attachment = 1,
+		layout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 	}
 
 	subpass := vk.SubpassDescription{
 		pipelineBindPoint = .GRAPHICS,
 		colorAttachmentCount = 1,
 		pColorAttachments = &ca_ref,
+		pDepthStencilAttachment = &depth_ref,
 	}
+
+	attachments := []vk.AttachmentDescription{color_attachment, depth_attachment}
 
 	if result := vk.CreateRenderPass(app.device, &vk.RenderPassCreateInfo{
 		sType = .RENDER_PASS_CREATE_INFO,
-		attachmentCount = 1,
-		pAttachments = &color_attachment,
+		attachmentCount = u32(len(attachments)),
+		pAttachments = raw_data(attachments),
 		subpassCount = 1,
 		pSubpasses = &subpass,
 		dependencyCount = 1,
 		pDependencies = &vk.SubpassDependency{
 			srcSubpass = vk.SUBPASS_EXTERNAL,
 			dstSubpass = 0,
-			srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
-			dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
-			dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+			srcStageMask = {.COLOR_ATTACHMENT_OUTPUT, .EARLY_FRAGMENT_TESTS},
+			dstStageMask = {.COLOR_ATTACHMENT_OUTPUT, .EARLY_FRAGMENT_TESTS},
+			dstAccessMask = {.COLOR_ATTACHMENT_WRITE, .DEPTH_STENCIL_ATTACHMENT_WRITE},
 		},
 	}, nil, &app.render_pass); result != .SUCCESS {
 		panic("Could not create render pass")
@@ -1115,6 +1242,18 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 		subpass = 0,
 		basePipelineHandle = {},
 		basePipelineIndex = -1,
+		pDepthStencilState = &vk.PipelineDepthStencilStateCreateInfo{
+			sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+			depthTestEnable = true,
+			depthWriteEnable = true,
+			depthCompareOp = .LESS,
+			depthBoundsTestEnable = false,
+			minDepthBounds = 0.0,
+			maxDepthBounds = 1.0,
+			stencilTestEnable = false,
+			front = {},
+			back = {},
+		},
 	}, nil, &pipeline); result != .SUCCESS {
 		panic("failed to create graphics pipeline")
 	}
