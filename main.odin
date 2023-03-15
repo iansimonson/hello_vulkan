@@ -10,6 +10,7 @@ import "core:math"
 import "core:math/linalg"
 import rt "core:runtime"
 import "core:thread"
+import "core:sync"
 import "vendor:glfw"
 import stbi "vendor:stb/image"
 import vk "vendor:vulkan"
@@ -102,11 +103,13 @@ indices_md := BufferMetaData{
 }
 
 global_app: ^Hello_Triangle
+minimized_sync: sync.Atomic_Cond
+minimized_sync_mut: sync.Atomic_Mutex
 
 main :: proc() {
 
 	app := init()
-	global_app = &app
+	global_app = app
 	defer cleanup(app)
 
 	extension_count: u32
@@ -135,7 +138,7 @@ main :: proc() {
 		run_renderer(global_app)
 	})
 
-	run(&app)
+	run(app)
 
 	fmt.println("Exiting...")
 }
@@ -178,6 +181,7 @@ Hello_Triangle :: struct {
 	command_buffers: [MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer,
 	image_available_sems, render_finished_sems: [MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
 	inflight_fences: [MAX_FRAMES_IN_FLIGHT]vk.Fence,
+	framebuffer_resized: bool,
 	current_frame: u32,
 }
 
@@ -193,8 +197,20 @@ run_renderer :: proc(app: ^Hello_Triangle) {
 }
 
 run :: proc(app: ^Hello_Triangle) {
+	was_minimized := false
 	for !glfw.WindowShouldClose(app.window) {
-		glfw.PollEvents()
+		width, height := glfw.GetFramebufferSize(app.window)
+		if width == 0 || height == 0 {
+			was_minimized = true
+			glfw.WaitEvents()
+		} else {
+			if was_minimized {
+				was_minimized = false
+				sync.atomic_cond_signal(&minimized_sync)
+				fmt.println("waking up renderer thread")
+			}
+			glfw.PollEvents()
+		}
 	}
 	should_close = true
 
@@ -269,6 +285,42 @@ end_single_time_commands :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer)
 	vk.QueueWaitIdle(app.graphics_queue)
 
 	vk.FreeCommandBuffers(app.device, app.command_pool, 1, &buffer)
+}
+
+recreate_swap_chain :: proc(app: ^Hello_Triangle) {
+	
+	for width, height := glfw.GetFramebufferSize(app.window); width == 0 || height == 0; width, height = glfw.GetFramebufferSize(app.window) {
+		fmt.println("Minimized - renderer going to sleep")
+		sync.atomic_mutex_lock(&minimized_sync_mut)
+		defer sync.atomic_mutex_unlock(&minimized_sync_mut)
+		sync.atomic_cond_wait(&minimized_sync, &minimized_sync_mut)
+	}
+
+	vk.DeviceWaitIdle(app.device)
+
+	cleanup_swap_chain(app)
+
+	create_swap_chain(app)
+	create_image_views(app)
+	create_depth_resources(app)
+	create_frame_buffers(app)
+}
+
+cleanup_swap_chain :: proc(app: ^Hello_Triangle) {
+	defer vk.DestroySwapchainKHR(app.device, app.swap_chain, nil)
+	defer {
+		for image_view in app.swap_chain_image_views {
+			vk.DestroyImageView(app.device, image_view, nil)
+		}
+		clear(&app.swap_chain_image_views)
+	}
+	defer destroy_depth_resources(app^)
+	defer {
+		for fb in app.swap_chain_frame_buffers {
+			vk.DestroyFramebuffer(app.device, fb, nil)
+		}
+		clear(&app.swap_chain_frame_buffers)
+	}
 }
 
 find_supported_format :: proc(app: ^Hello_Triangle, candidates: []vk.Format, tiling: vk.ImageTiling, features: vk.FormatFeatureFlags) -> vk.Format {
@@ -409,6 +461,13 @@ create_image_view :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Form
 		panic("Failed to create texture image")
 	}
 	return
+}
+
+create_image_views :: proc(app: ^Hello_Triangle) {
+	app.swap_chain_image_views = make([dynamic]vk.ImageView, len(app.swap_chain_images))
+	for image, i in app.swap_chain_images {
+		app.swap_chain_image_views[i] = create_image_view(app, image, app.swap_chain_image_format, {.COLOR})
+	}
 }
 
 create_texture_sampler :: proc(app: ^Hello_Triangle) {
@@ -788,10 +847,24 @@ update_uniform_buffer :: proc(app: ^Hello_Triangle, current_image: u32) {
 
 draw_frame :: proc(app: ^Hello_Triangle) {
 	vk.WaitForFences(app.device, 1, &app.inflight_fences[app.current_frame], true, max(u64))
-	vk.ResetFences(app.device, 1, &app.inflight_fences[app.current_frame])
+
+	if app.framebuffer_resized {
+		app.framebuffer_resized = false
+		recreate_swap_chain(app)
+		return
+	}
 
 	image_index: u32
-	vk.AcquireNextImageKHR(app.device, app.swap_chain, max(u64), app.image_available_sems[app.current_frame], {}, &image_index)
+	result := vk.AcquireNextImageKHR(app.device, app.swap_chain, max(u64), app.image_available_sems[app.current_frame], {}, &image_index)
+	if result == .ERROR_OUT_OF_DATE_KHR {
+		recreate_swap_chain(app)
+		return
+	} else if result != .SUCCESS && result != .SUBOPTIMAL_KHR { // .SUBOPTIMAL_KHR is considered a "success" return
+		panic("Failed to acquire swap chain image!")
+	}
+
+	vk.ResetFences(app.device, 1, &app.inflight_fences[app.current_frame])
+
 	vk.ResetCommandBuffer(app.command_buffers[app.current_frame], {})
 
 	record_command_buffer(app, app.command_buffers[app.current_frame], int(image_index))
@@ -800,7 +873,7 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 
 	update_uniform_buffer(app, app.current_frame)
 
-	if vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
+	if result = vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
 		sType = .SUBMIT_INFO,
 		waitSemaphoreCount = 1,
 		pWaitSemaphores = &app.image_available_sems[app.current_frame],
@@ -809,11 +882,11 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 		pCommandBuffers = &app.command_buffers[app.current_frame],
 		signalSemaphoreCount = 1,
 		pSignalSemaphores = &app.render_finished_sems[app.current_frame],
-	}, app.inflight_fences[app.current_frame]) != .SUCCESS {
-		panic("failed to submit draw command buffer!")
+	}, app.inflight_fences[app.current_frame]); result != .SUCCESS {
+		fmt.panicf("failed to submit draw command buffer! got=%v", result)
 	}
 
-	vk.QueuePresentKHR(app.present_queue, &vk.PresentInfoKHR{
+	result = vk.QueuePresentKHR(app.present_queue, &vk.PresentInfoKHR{
 		sType = .PRESENT_INFO_KHR,
 		waitSemaphoreCount = 1,
 		pWaitSemaphores = &app.render_finished_sems[app.current_frame],
@@ -823,25 +896,41 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 		pResults = nil,
 	})
 
+	if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR || app.framebuffer_resized {
+		app.framebuffer_resized = false
+		recreate_swap_chain(app)
+	} else if result != .SUCCESS {
+		panic("Failed to present the swap chain image!")
+	}
+
 	app.current_frame = (app.current_frame + 1) % MAX_FRAMES_IN_FLIGHT
 
 }
 
+framebuffer_resize_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
+	app := (^Hello_Triangle)(glfw.GetWindowUserPointer(window))
+	app.framebuffer_resized = true
+}
+
 global_ctx: rt.Context
 
-init :: proc() -> (app: Hello_Triangle) {
+init :: proc() -> (app: ^Hello_Triangle) {
 	global_ctx = context
 	context.user_ptr = &global_ctx
+
+	app = new(Hello_Triangle)
 
 	glfw.Init()
 	// NOTE: this has to be called after glfw.Init()
 	vk.load_proc_addresses_global(rawptr(glfw.GetInstanceProcAddress))
 
 	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
-	glfw.WindowHint(glfw.RESIZABLE, GLFW_FALSE)
 	window := glfw.CreateWindow(WIDTH, HEIGHT, "Hello Vulkan", nil, nil)
 	assert(window != nil, "Window could not be crated")
 	app.window = window
+
+	glfw.SetWindowUserPointer(window, app)
+	glfw.SetFramebufferSizeCallback(app.window, framebuffer_resize_callback)
 
 	instance, ok := create_instance()
 	assert(ok, "Couldn't create vulkan window")
@@ -871,51 +960,43 @@ init :: proc() -> (app: Hello_Triangle) {
 		panic("Couldn't create surface")
 	}
 
-	app.physical_device = pick_physical_device(app)
-	app.device, app.graphics_queue, app.present_queue = create_logical_device(app)
-	app.swap_chain = create_swap_chain(&app)
+	app.physical_device = pick_physical_device(app^)
+	app.device, app.graphics_queue, app.present_queue = create_logical_device(app^)
+	create_swap_chain(app)
+	create_image_views(app)
 
-	app.swap_chain_image_views = make([dynamic]vk.ImageView, len(app.swap_chain_images))
-	for image, i in app.swap_chain_images {
-		app.swap_chain_image_views[i] = create_image_view(&app, image, app.swap_chain_image_format, {.COLOR})
-	}
-
-	create_render_pass(&app)
-	create_descriptor_set_layout(&app)
-	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(&app)
+	create_render_pass(app)
+	create_descriptor_set_layout(app)
+	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(app)
 
 	
-	app.command_pool = create_command_pool(&app)
-	create_command_buffers(&app)
+	app.command_pool = create_command_pool(app)
+	create_command_buffers(app)
 	
-	create_depth_resources(&app)
-	app.swap_chain_frame_buffers = create_frame_buffers(&app)
-	create_texture_image(&app)
-	create_texture_image_view(&app)
-	create_texture_sampler(&app)
-	create_full_buffer(&app)
-	initialize_buffers(&app)
-	create_uniform_buffers(&app)
-	create_descriptor_pool(&app)
-	create_descriptor_sets(&app)
+	create_depth_resources(app)
+	create_frame_buffers(app)
+	create_texture_image(app)
+	create_texture_image_view(app)
+	create_texture_sampler(app)
+	create_full_buffer(app)
+	initialize_buffers(app)
+	create_uniform_buffers(app)
+	create_descriptor_pool(app)
+	create_descriptor_sets(app)
 
-	create_sync_objects(&app)
+	create_sync_objects(app)
 	return
 }
 
-cleanup :: proc(app: Hello_Triangle) {
+cleanup :: proc(app: ^Hello_Triangle) {
+	defer free(app)
 	defer glfw.Terminate()
 	defer glfw.DestroyWindow(app.window)
 	defer vk.DestroyInstance(app.instance, nil)
 	defer destroy_debug_messenger(app.instance, app.dbg_msgr, nil)
 	defer vk.DestroyDevice(app.device, nil)
 	defer vk.DestroySurfaceKHR(app.instance, app.surface, nil)
-	defer vk.DestroySwapchainKHR(app.device, app.swap_chain, nil)
-	defer {
-		for image_view in app.swap_chain_image_views {
-			vk.DestroyImageView(app.device, image_view, nil)
-		}
-	}
+
 	defer vk.DestroyRenderPass(app.device, app.render_pass, nil)
 	defer vk.DestroyPipelineLayout(app.device, app.pipeline_layout, nil)
 	defer vk.DestroyDescriptorSetLayout(app.device, app.descriptor_set_layout, nil)
@@ -927,16 +1008,10 @@ cleanup :: proc(app: Hello_Triangle) {
 		}
 	}
 	defer vk.DestroyPipeline(app.device, app.graphics_pipeline, nil)
-	defer {
-		for fb in app.swap_chain_frame_buffers {
-			vk.DestroyFramebuffer(app.device, fb, nil)
-		}
-	}
-	defer destroy_depth_resources(app)
-	defer destroy_image(app, app.texture_image, app.texture_memory)
+	defer destroy_image(app^, app.texture_image, app.texture_memory)
 	defer vk.DestroyImageView(app.device, app.texture_image_view, nil)
 	defer vk.DestroySampler(app.device, app.texture_sampler, nil)
-	defer destroy_buffer(app, app.everything_buffer, app.everything_memory)
+	defer destroy_buffer(app^, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
 	defer vk.DestroyDescriptorPool(app.device, app.descriptor_pool, nil)
 	defer {
@@ -946,6 +1021,7 @@ cleanup :: proc(app: Hello_Triangle) {
 			defer vk.DestroyFence(app.device, app.inflight_fences[i], nil)
 		}
 	}
+	defer cleanup_swap_chain(app)
 }
 
 create_sync_objects :: proc(app: ^Hello_Triangle) {
@@ -1046,8 +1122,8 @@ create_command_pool :: proc(app: ^Hello_Triangle) -> (pool: vk.CommandPool) {
 	return
 }
 
-create_frame_buffers :: proc(app: ^Hello_Triangle) -> (fb: [dynamic]vk.Framebuffer) {
-	resize(&fb, len(app.swap_chain_image_views))
+create_frame_buffers :: proc(app: ^Hello_Triangle) {
+	resize(&app.swap_chain_frame_buffers, len(app.swap_chain_image_views))
 	for view, i in app.swap_chain_image_views {
 		attachments := [?]vk.ImageView{view, app.depth_image_view}
 		if result := vk.CreateFramebuffer(app.device, &vk.FramebufferCreateInfo{
@@ -1058,7 +1134,7 @@ create_frame_buffers :: proc(app: ^Hello_Triangle) -> (fb: [dynamic]vk.Framebuff
 			width = app.swap_chain_extent.width,
 			height = app.swap_chain_extent.height,
 			layers = 1,
-		}, nil, &fb[i]); result != .SUCCESS {
+		}, nil, &app.swap_chain_frame_buffers[i]); result != .SUCCESS {
 			panic("failed to create framebuffer!")
 		}
 	}
@@ -1277,7 +1353,7 @@ create_shader_module :: proc(app: ^Hello_Triangle, code: []byte) -> (sm: vk.Shad
 	return
 }
 
-create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
+create_swap_chain :: proc(app: ^Hello_Triangle) {
 	swapchain_support := query_swap_chain_support(app^, app.physical_device)
 	surface_format := choose_swap_surface_format(swapchain_support.formats[:])
 	present_mode := choose_swap_present_mode(swapchain_support.present_modes[:])
@@ -1302,6 +1378,7 @@ create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
 		compositeAlpha = {.OPAQUE},
 		presentMode = present_mode,
 		clipped = true,
+		oldSwapchain = {},
 	}
 
 	indices := find_queue_families(app^, app.physical_device)
@@ -1315,24 +1392,22 @@ create_swap_chain :: proc(app: ^Hello_Triangle) -> vk.SwapchainKHR {
 		create_info.imageSharingMode = .EXCLUSIVE
 	}
 
-	swap_chain: vk.SwapchainKHR
-	if vk.CreateSwapchainKHR(app.device, &create_info, nil, &swap_chain) != .SUCCESS {
+	if vk.CreateSwapchainKHR(app.device, &create_info, nil, &app.swap_chain) != .SUCCESS {
 		panic("Could not create swap chain!")
 	}
 
 	sc_image_count: u32
-	vk.GetSwapchainImagesKHR(app.device, swap_chain, &sc_image_count, nil)
+	vk.GetSwapchainImagesKHR(app.device, app.swap_chain, &sc_image_count, nil)
 	app.swap_chain_images = make([dynamic]vk.Image, sc_image_count)
 	vk.GetSwapchainImagesKHR(
 		app.device,
-		swap_chain,
+		app.swap_chain,
 		&sc_image_count,
 		raw_data(app.swap_chain_images),
 	)
 
 	app.swap_chain_image_format = surface_format.format
 	app.swap_chain_extent = extent
-	return swap_chain
 }
 
 choose_swap_surface_format :: proc(
@@ -1361,9 +1436,9 @@ choose_swap_extent :: proc(
 	app: Hello_Triangle,
 	capabilities: vk.SurfaceCapabilitiesKHR,
 ) -> vk.Extent2D {
-	if capabilities.currentExtent.width != max(u32) {
-		return capabilities.currentExtent
-	} else {
+	// if capabilities.currentExtent.width != max(u32) {
+		// return capabilities.currentExtent
+	// } else {
 		width, height := glfw.GetFramebufferSize(app.window)
 
 		actual_extent := vk.Extent2D{u32(width), u32(height)}
@@ -1378,7 +1453,7 @@ choose_swap_extent :: proc(
 			capabilities.maxImageExtent.height,
 		)
 		return actual_extent
-	}
+	// }
 }
 
 create_logical_device :: proc(
