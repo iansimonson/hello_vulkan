@@ -99,9 +99,9 @@ Hello_Triangle :: struct {
 	texture_sampler: vk.Sampler,
 	everything_buffer: vk.Buffer, // positions, colors, indices
 	everything_memory: vk.DeviceMemory, // positions, colors, indicies
-	uniform_buffers: [MAX_FRAMES_IN_FLIGHT]vk.Buffer,
-	uniform_memories: [MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
-	uniform_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr,
+	uniform_buffer: vk.Buffer, // holds all the uniform buffers
+	uniform_memory: vk.DeviceMemory, // holds all the uniform memories
+	uniform_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr, // mapped to offsets in above
 	descriptor_pool: vk.DescriptorPool,
 	descriptor_sets: [MAX_FRAMES_IN_FLIGHT]vk.DescriptorSet,
 	command_pool: vk.CommandPool,
@@ -689,10 +689,13 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 
 create_uniform_buffers :: proc(app: ^Hello_Triangle) {
 	buffer_size := vk.DeviceSize(size_of(UniformBufferObject))
+	app.uniform_buffer, app.uniform_memory = create_buffer(app, MAX_FRAMES_IN_FLIGHT * buffer_size, {.UNIFORM_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT})
 
+	raw_uniform: rawptr
+
+	vk.MapMemory(app.device, app.uniform_memory, 0, MAX_FRAMES_IN_FLIGHT * buffer_size, nil, &raw_uniform)
 	for i in 0..<MAX_FRAMES_IN_FLIGHT {
-		app.uniform_buffers[i], app.uniform_memories[i] = create_buffer(app, buffer_size, {.UNIFORM_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT})
-		vk.MapMemory(app.device, app.uniform_memories[i], 0, buffer_size, nil, &app.uniform_buffers_mapped[i])
+		app.uniform_buffers_mapped[i] = rawptr(uintptr(raw_uniform) + uintptr(i * int(buffer_size)))
 	}
 }
 
@@ -744,8 +747,8 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 				descriptorType = .UNIFORM_BUFFER,
 				descriptorCount = 1,
 				pBufferInfo = &vk.DescriptorBufferInfo{
-					buffer = app.uniform_buffers[i],
-					offset = 0,
+					buffer = app.uniform_buffer,
+					offset = vk.DeviceSize(i * size_of(UniformBufferObject)),
 					range = size_of(UniformBufferObject),
 				},
 			},
@@ -1021,13 +1024,11 @@ cleanup :: proc(app: ^Hello_Triangle) {
 	defer vk.DestroyRenderPass(app.device, app.render_pass, nil)
 	defer vk.DestroyPipelineLayout(app.device, app.pipeline_layout, nil)
 	defer vk.DestroyDescriptorSetLayout(app.device, app.descriptor_set_layout, nil)
-	defer {
-		for i in 0..<MAX_FRAMES_IN_FLIGHT {
-			defer vk.DestroyBuffer(app.device, app.uniform_buffers[i], nil)
-			defer vk.FreeMemory(app.device, app.uniform_memories[i], nil)
-			defer vk.UnmapMemory(app.device, app.uniform_memories[i])
-		}
-	}
+
+	defer vk.DestroyBuffer(app.device, app.uniform_buffer, nil)
+	defer vk.FreeMemory(app.device, app.uniform_memory, nil)
+	defer vk.UnmapMemory(app.device, app.uniform_memory)
+
 	defer vk.DestroyPipeline(app.device, app.graphics_pipeline, nil)
 	defer unload_object(app.render_object)
 	defer destroy_image(app^, app.texture_image, app.texture_memory)
