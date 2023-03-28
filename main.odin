@@ -1,6 +1,5 @@
 package main
 
-import "core:c"
 import "core:fmt"
 import "core:strings"
 import "core:os"
@@ -68,11 +67,6 @@ main :: proc() {
 
 	fmt.println("Exiting...")
 }
-
-GLFW_FALSE :: 0
-
-WIDTH :: 800
-HEIGHT :: 600
 
 Hello_Triangle :: struct {
 	window:                  glfw.WindowHandle,

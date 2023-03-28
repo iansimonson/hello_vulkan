@@ -37,3 +37,8 @@ device_extensions := make_device_extensions()
 
 fragment_shader :: #load("./shaders/frag.spv")
 vertex_shader :: #load("./shaders/vert.spv")
+
+GLFW_FALSE :: 0
+
+WIDTH :: 800
+HEIGHT :: 600
