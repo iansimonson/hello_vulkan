@@ -20,14 +20,16 @@ import vk "vendor:vulkan"
 
 main :: proc() {
 
-	ta: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&ta, context.allocator)
-	defer mem.tracking_allocator_destroy(&ta)
-	defer fmt.printf("%#v\n", ta.allocation_map)
-	defer fmt.println("total tmp space used (mb):", f32((cast(^rt.Arena)context.temp_allocator.data).total_used) / 1024.0 / 1024.0)
-	alloc := mem.tracking_allocator(&ta)
-	
-	context.allocator = alloc
+	when ODIN_DEBUG {
+		ta: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&ta, context.allocator)
+		defer mem.tracking_allocator_destroy(&ta)
+		defer fmt.printf("%#v\n", ta.allocation_map)
+		defer fmt.println("total tmp space used (mb):", f32((cast(^rt.Arena)context.temp_allocator.data).total_used) / 1024.0 / 1024.0)
+		alloc := mem.tracking_allocator(&ta)
+
+		context.allocator = alloc
+	}
 
 	app := init()
 	defer cleanup(app)
@@ -59,7 +61,7 @@ main :: proc() {
 		run_renderer(app)
 	})
 	t.user_args[0] = app
-	defer thread.destroy(t)
+	defer thread.destroy(t) // calls join()
 	
 	thread.start(t)
 	run(app)
@@ -121,13 +123,11 @@ Vertex_Offsets :: struct {
 
 // terrible but works
 should_close: bool = false
-out: bool = false
 
 run_renderer :: proc(app: ^Hello_Triangle) {
 	for !should_close {
 		draw_frame(app)
 	}
-	out = true
 }
 
 run :: proc(app: ^Hello_Triangle) {
@@ -146,9 +146,6 @@ run :: proc(app: ^Hello_Triangle) {
 		glfw.WaitEvents()
 	}
 	should_close = true
-
-	for !out {}
-	vk.DeviceWaitIdle(app.device)
 }
 
 create_descriptor_set_layout :: proc(app: ^Hello_Triangle) {
@@ -998,7 +995,6 @@ init :: proc() -> (app: ^Hello_Triangle) {
 	create_frame_buffers(app)
 
 	load_model(app)
-	fmt.printf("%#v\n", app.render_object.indices[:30])
 	create_texture_image(app)
 	create_texture_image_view(app)
 	create_texture_sampler(app)
@@ -1048,6 +1044,7 @@ cleanup :: proc(app: ^Hello_Triangle) {
 		}
 	}
 	defer cleanup_swap_chain_destroy(app)
+	defer vk.DeviceWaitIdle(app.device)
 }
 
 load_model :: proc(app: ^Hello_Triangle) {
