@@ -97,6 +97,7 @@ Hello_Triangle :: struct {
 	uniform_buffer: vk.Buffer, // holds all the uniform buffers
 	uniform_memory: vk.DeviceMemory, // holds all the uniform memories
 	uniform_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr, // mapped to offsets in above
+	shader_storage_buffers_mapped: [MAX_FRAMES_IN_FLIGHT]rawptr,
 	descriptor_pool: vk.DescriptorPool,
 	descriptor_sets: [MAX_FRAMES_IN_FLIGHT]vk.DescriptorSet,
 	command_pool: vk.CommandPool,
@@ -158,7 +159,18 @@ create_descriptor_set_layout :: proc(app: ^Hello_Triangle) {
 		stageFlags = {.FRAGMENT},
 	}
 
-	bindings := []vk.DescriptorSetLayoutBinding{ubo_layout_binding, sampler_layout_binding}
+	gol_layout_binding: [MAX_FRAMES_IN_FLIGHT]vk.DescriptorSetLayoutBinding
+	for i in 0..<MAX_FRAMES_IN_FLIGHT {
+		gol_layout_binding[i] = vk.DescriptorSetLayoutBinding{
+			binding = u32(2 + i),
+			descriptorCount = 1,
+			descriptorType = .STORAGE_BUFFER,
+			pImmutableSamplers = nil,
+			stageFlags = {.COMPUTE},
+		}
+	}
+
+	bindings := []vk.DescriptorSetLayoutBinding{ubo_layout_binding, sampler_layout_binding, gol_layout_binding[0], gol_layout_binding[1]}
 	
 	if vk.CreateDescriptorSetLayout(app.device, &vk.DescriptorSetLayoutCreateInfo{
 		sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -614,11 +626,11 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.
 
 create_full_buffer :: proc(app: ^Hello_Triangle) {
 	// this should be fine since they all have the same alignment
-	position_size, color_size, index_size, texture_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:])
-	total_allocation_size := position_size + color_size + index_size + texture_size
+	position_size, color_size, index_size, texture_size, gol_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:]), size_of(GOL)
+	total_allocation_size := position_size + color_size + index_size + texture_size + gol_size
 
 	fmt.println("FULL ALLOC:", total_allocation_size)
-	app.everything_buffer, app.everything_memory = create_buffer(app, vk.DeviceSize(total_allocation_size), {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
+	app.everything_buffer, app.everything_memory = create_buffer(app, vk.DeviceSize(total_allocation_size), {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER, .STORAGE_BUFFER}, {.DEVICE_LOCAL})
 }
 
 slice_size :: proc(s: $T/[]$E) -> int {
@@ -631,30 +643,34 @@ slice_size :: proc(s: $T/[]$E) -> int {
 /// from staging offset to everything buffer offset
 initialize_buffers :: proc(app: ^Hello_Triangle) {
 
-	position_size, color_size, index_size, texture_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:])
-	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size
-	staging_memory_size := position_size + color_size + texture_size + index_size
+	position_size, color_size, index_size, texture_size, gol_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:]), MAX_FRAMES_IN_FLIGHT * size_of(GOL)
+	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset, staging_gol_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size, position_size + color_size + index_size + texture_size
+	staging_memory_size := position_size + color_size + texture_size + index_size + gol_size
 
 	staging_buffer, staging_memory := create_buffer(app, vk.DeviceSize(staging_memory_size), {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
 
 	staging_data: rawptr // full data
-	position_data, color_data, index_data, texture_data: rawptr // views
+	position_data, color_data, index_data, texture_data, gol_data: rawptr // views
 
 	vk.MapMemory(app.device, staging_memory, 0, vk.DeviceSize(staging_memory_size), nil, &staging_data)
 	
-	position_data, color_data, index_data, texture_data = 
+	position_data, color_data, index_data, texture_data, gol_data = 
 		rawptr(uintptr(staging_data) + uintptr(staging_position_offset)),
 		rawptr(uintptr(staging_data) + uintptr(staging_color_offset)),
 		rawptr(uintptr(staging_data) + uintptr(staging_index_offset)),
-		rawptr(uintptr(staging_data) + uintptr(staging_texture_offset))
+		rawptr(uintptr(staging_data) + uintptr(staging_texture_offset)),
+		rawptr(uintptr(staging_data) + uintptr(staging_gol_offset))
 	
-	raw_vertices, raw_colors, raw_indices, raw_textures := slice.to_bytes(app.render_object.vertices[:]), slice.to_bytes(app.render_object.colors[:]), slice.to_bytes(app.render_object.indices[:]), slice.to_bytes(app.render_object.texture_coords[:])
+	raw_vertices, raw_colors, raw_indices, raw_textures, raw_gol := slice.to_bytes(app.render_object.vertices[:]), slice.to_bytes(app.render_object.colors[:]), slice.to_bytes(app.render_object.indices[:]), slice.to_bytes(app.render_object.texture_coords[:]), slice.to_bytes(GOL[:])
 	
 	mem.copy(position_data, raw_data(raw_vertices), len(raw_vertices))
 	mem.copy(color_data, raw_data(raw_colors), len(raw_colors))
 	mem.copy(index_data, raw_data(raw_indices), len(raw_indices))
 	mem.copy(texture_data, raw_data(raw_textures), len(raw_textures))
+	for i in 0..<MAX_FRAMES_IN_FLIGHT {
+		mem.copy(rawptr(uintptr(gol_data) + uintptr(i * size_of(GOL))), raw_data(raw_gol), len(raw_gol))
+	}
 	
 	vk.UnmapMemory(app.device, staging_memory)
 
@@ -678,6 +694,11 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 			size = vk.DeviceSize(texture_size),
 			srcOffset = vk.DeviceSize(staging_texture_offset),
 			dstOffset = app.render_offsets.texture_coords,
+		},
+		{
+			size = vk.DeviceSize(gol_size),
+			srcOffset = vk.DeviceSize(staging_gol_offset),
+			dstOffset = vk.DeviceSize(staging_gol_offset),
 		},
 	})
 }
@@ -704,6 +725,10 @@ create_descriptor_pool :: proc(app: ^Hello_Triangle) {
 		{
 			type = .COMBINED_IMAGE_SAMPLER,
 			descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
+		},
+		{
+			type = .STORAGE_BUFFER,
+			descriptorCount = 2 * u32(MAX_FRAMES_IN_FLIGHT),
 		},
 	}
 
@@ -758,6 +783,32 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 					imageLayout = .SHADER_READ_ONLY_OPTIMAL,
 					imageView = app.texture_image_view,
 					sampler = app.texture_sampler,
+				},
+			},
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = app.descriptor_sets[i],
+				dstBinding = 2,
+				dstArrayElement = 0,
+				descriptorType = .STORAGE_BUFFER,
+				descriptorCount = 1,
+				pBufferInfo = &vk.DescriptorBufferInfo{
+					buffer = app.everything_buffer,
+					offset = app.render_offsets.texture_coords + vk.DeviceSize(slice_size(app.render_object.texture_coords[:])) + vk.DeviceSize(((i - 1) % MAX_FRAMES_IN_FLIGHT) * size_of(GOL)),
+					range = vk.DeviceSize(slice_size(GOL[:])),
+				},
+			},
+			{
+				sType = .WRITE_DESCRIPTOR_SET,
+				dstSet = app.descriptor_sets[i],
+				dstBinding = 3,
+				dstArrayElement = 0,
+				descriptorType = .STORAGE_BUFFER,
+				descriptorCount = 1,
+				pBufferInfo = &vk.DescriptorBufferInfo{
+					buffer = app.everything_buffer,
+					offset = app.render_offsets.texture_coords + vk.DeviceSize(slice_size(app.render_object.texture_coords[:])) + vk.DeviceSize(((i) % MAX_FRAMES_IN_FLIGHT) * size_of(GOL)),
+					range = vk.DeviceSize(slice_size(GOL[:])),
 				},
 			},
 		}
@@ -1148,7 +1199,7 @@ create_command_pool :: proc(app: ^Hello_Triangle) -> (pool: vk.CommandPool) {
 	if result := vk.CreateCommandPool(app.device, &vk.CommandPoolCreateInfo{
 		sType = .COMMAND_POOL_CREATE_INFO,
 		flags = {.RESET_COMMAND_BUFFER},
-		queueFamilyIndex = indices.graphics_family.(u32),
+		queueFamilyIndex = indices.graphics_and_compute_family.(u32),
 	}, nil, &pool); result != .SUCCESS {
 		panic("Failed to create command pool!")
 	}
@@ -1240,6 +1291,8 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 	defer vk.DestroyShaderModule(app.device, vert_shader_module, nil)
 	frag_shader_module := create_shader_module(app, fragment_shader)
 	defer vk.DestroyShaderModule(app.device, frag_shader_module, nil)
+	compute_shader_module := create_shader_module(app, compute_shader)
+	defer vk.DestroyShaderModule(app.device, compute_shader_module, nil)
 
 	shader_stages := [?]vk.PipelineShaderStageCreateInfo{
 		{
@@ -1252,6 +1305,12 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
 			stage = {.FRAGMENT},
 			module = frag_shader_module,
+			pName = "main",
+		},
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.COMPUTE},
+			module = compute_shader_module,
 			pName = "main",
 		},
 	}
@@ -1504,6 +1563,7 @@ create_logical_device :: proc(
 
 	queue_set := make(map[u32]u32)
 	defer delete(queue_set)
+	queue_set[indices.graphics_and_compute_family.(u32)] = 1
 	queue_set[indices.graphics_family.(u32)] = 1
 	queue_set[indices.present_family.(u32)] = 1
 
@@ -1548,7 +1608,7 @@ create_logical_device :: proc(
 		panic("failed to create logical device!")
 	}
 
-	vk.GetDeviceQueue(dev, indices.graphics_family.(u32), 0, &graphics)
+	vk.GetDeviceQueue(dev, indices.graphics_and_compute_family.(u32), 0, &graphics)
 	vk.GetDeviceQueue(dev, indices.present_family.(u32), 0, &present)
 
 	return
@@ -1608,6 +1668,7 @@ is_device_suitable :: proc(app: Hello_Triangle, device: vk.PhysicalDevice) -> bo
 
 Queue_Family_Indices :: struct {
 	graphics_family: Maybe(u32),
+	graphics_and_compute_family: Maybe(u32),
 	present_family:  Maybe(u32),
 }
 
@@ -1635,7 +1696,9 @@ find_queue_families :: proc(
 	)
 
 	for queue_family, i in queue_families {
-		if .GRAPHICS in queue_family.queueFlags {
+		if .GRAPHICS in queue_family.queueFlags && .COMPUTE in queue_family.queueFlags {
+			indices.graphics_and_compute_family = u32(i)
+		} else if .GRAPHICS in queue_family.queueFlags {
 			indices.graphics_family = u32(i)
 		}
 		present_support: b32

@@ -1,0 +1,60 @@
+#version 450
+
+const int rules[18] = int[18](0, 0, 0, 1, 0, 0, 0, 0, 0,
+                                0, 0, 1, 1, 0, 0, 0, 0, 0);
+
+const int GRID_SIZE = 16;
+
+layout(std140, binding = 2) readonly buffer CellsSSBOIn {
+    int cells[];
+} src;
+
+layout(std140, binding = 3) buffer CellsSSBOOut {
+    int cells[];
+} dst;
+
+layout (local_size_x = 256, local_size_y = 256, local_size_z = 1) in;
+
+void get_neighbors(ivec2 pos, inout ivec2 neighbors[8]) {
+    neighbors = ivec2[8](
+        (pos + ivec2(-1, -1) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(0, -1) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(1, -1) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(-1, 0) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(1, 0) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(-1, 1) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(0, 1) + GRID_SIZE) % GRID_SIZE,
+        (pos + ivec2(1, 1) + GRID_SIZE) % GRID_SIZE
+    );
+}
+
+ivec2 pos_from_index(int index) {
+    return ivec2(index % GRID_SIZE, index / GRID_SIZE);
+}
+
+int index_from_pos(ivec2 pos) {
+    return pos.y * GRID_SIZE + pos.x;
+}
+
+void main() {
+    int index = int(gl_GlobalInvocationID.x);
+    ivec2 pos = pos_from_index(index);
+    ivec2 neighbors[8];
+    get_neighbors(pos, neighbors);
+
+    int summed_neighbors = 
+        src.cells[index_from_pos(neighbors[0])] +
+        src.cells[index_from_pos(neighbors[1])] +
+        src.cells[index_from_pos(neighbors[2])] +
+        src.cells[index_from_pos(neighbors[3])] +
+        src.cells[index_from_pos(neighbors[4])] +
+        src.cells[index_from_pos(neighbors[5])] +
+        src.cells[index_from_pos(neighbors[6])] +
+        src.cells[index_from_pos(neighbors[7])];
+
+    int my_val = src.cells[index];
+
+    int rule_value = ((my_val) * 9) + summed_neighbors;
+
+    dst.cells[index] = rules[rule_value];
+}
