@@ -96,8 +96,6 @@ Hello_Triangle :: struct {
 	swap_chain_image_format: vk.Format,
 	swap_chain_extent:       vk.Extent2D,
 	swap_chain_image_views:  [dynamic]vk.ImageView,
-	swap_chain_frame_buffers: [dynamic]vk.Framebuffer,
-	render_pass: vk.RenderPass,
 	descriptor_set_layout: vk.DescriptorSetLayout,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
@@ -242,7 +240,6 @@ recreate_swap_chain :: proc(app: ^Hello_Triangle) {
 	create_swap_chain(app)
 	create_image_views(app)
 	create_depth_resources(app)
-	create_frame_buffers(app)
 }
 
 cleanup_swap_chain :: proc(app: ^Hello_Triangle) {
@@ -254,19 +251,12 @@ cleanup_swap_chain :: proc(app: ^Hello_Triangle) {
 		clear(&app.swap_chain_image_views)
 	}
 	defer destroy_depth_resources(app^)
-	defer {
-		for fb in app.swap_chain_frame_buffers {
-			vk.DestroyFramebuffer(app.device, fb, nil)
-		}
-		clear(&app.swap_chain_frame_buffers)
-	}
 }
 
 cleanup_swap_chain_destroy :: proc(app: ^Hello_Triangle) {
 	cleanup_swap_chain(app)
 	delete(app.swap_chain_image_views)
 	delete(app.swap_chain_images)
-	delete(app.swap_chain_frame_buffers)
 }
 
 find_supported_format :: proc(app: ^Hello_Triangle, candidates: []vk.Format, tiling: vk.ImageTiling, features: vk.FormatFeatureFlags) -> vk.Format {
@@ -995,7 +985,6 @@ init :: proc() -> (app: ^Hello_Triangle) {
 	create_swap_chain(app)
 	create_image_views(app)
 
-	create_render_pass(app)
 	create_descriptor_set_layout(app)
 	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(app)
 
@@ -1004,7 +993,6 @@ init :: proc() -> (app: ^Hello_Triangle) {
 	create_command_buffers(app)
 	
 	create_depth_resources(app)
-	create_frame_buffers(app)
 
 	load_model(app)
 	create_texture_image(app)
@@ -1030,7 +1018,6 @@ cleanup :: proc(app: ^Hello_Triangle) {
 	defer vk.DestroyDevice(app.device, nil)
 	defer vk.DestroySurfaceKHR(app.instance, app.surface, nil)
 
-	defer vk.DestroyRenderPass(app.device, app.render_pass, nil)
 	defer vk.DestroyPipelineLayout(app.device, app.pipeline_layout, nil)
 	defer vk.DestroyDescriptorSetLayout(app.device, app.descriptor_set_layout, nil)
 
@@ -1102,6 +1089,35 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 		}
 	}
 
+	vk.CmdPipelineBarrier(buffer, {.TOP_OF_PIPE}, {.COLOR_ATTACHMENT_OUTPUT}, nil, 0, nil, 0, nil, 1, &vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		oldLayout = .UNDEFINED,
+		newLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		image = app.swap_chain_images[image_index],
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	})
+	vk.CmdPipelineBarrier(buffer, {.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, {.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, nil, 0, nil, 0, nil, 1, &vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		dstAccessMask = {.DEPTH_STENCIL_ATTACHMENT_WRITE},
+		oldLayout = .UNDEFINED,
+		newLayout = .DEPTH_ATTACHMENT_OPTIMAL_KHR,
+		image = app.depth_image,
+		subresourceRange = {
+			aspectMask = {.DEPTH},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	})
+
 	clear_values := []vk.ClearValue{
 		{
 			color = vk.ClearColorValue{float32 = {0.0, 0.0, 0.0, 1.0}},
@@ -1111,17 +1127,33 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 		},
 	}
 
-	vk.CmdBeginRenderPass(buffer, &vk.RenderPassBeginInfo{
-		sType = .RENDER_PASS_BEGIN_INFO,
-		renderPass = app.render_pass,
-		framebuffer = app.swap_chain_frame_buffers[image_index],
+	color_attachment := vk.RenderingAttachmentInfoKHR{
+		sType = .RENDERING_ATTACHMENT_INFO_KHR,
+		imageView = app.swap_chain_image_views[image_index],
+		imageLayout = .ATTACHMENT_OPTIMAL_KHR,
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		clearValue = clear_values[0],
+	}
+	depth_attachment := vk.RenderingAttachmentInfoKHR{
+		sType = .RENDERING_ATTACHMENT_INFO_KHR,
+		imageView = app.depth_image_view,
+		imageLayout = .DEPTH_ATTACHMENT_OPTIMAL_KHR,
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		clearValue = clear_values[1],
+	}
+
+	vk.CmdBeginRenderingKHR(buffer, &vk.RenderingInfoKHR{
+		sType = .RENDERING_INFO_KHR,
 		renderArea = {
 			extent = app.swap_chain_extent,
 		},
-		clearValueCount = u32(len(clear_values)),
-		pClearValues = raw_data(clear_values),
-	}, .INLINE)
-	defer vk.CmdEndRenderPass(buffer)
+		layerCount = 1,
+		colorAttachmentCount = 1,
+		pColorAttachments = &color_attachment,
+		pDepthAttachment = &depth_attachment,
+	})
 
 	vk.CmdSetViewport(buffer, 0, 1, &vk.Viewport{
 		width = f32(app.swap_chain_extent.width),
@@ -1142,6 +1174,22 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	vk.CmdBindDescriptorSets(buffer, .GRAPHICS, app.pipeline_layout, 0, 1, &app.descriptor_sets[app.current_frame], 0, nil)
 	vk.CmdDrawIndexed(buffer, u32(len(app.render_object.indices)), 1, 0, 0, 0)
 
+	vk.CmdEndRenderingKHR(buffer)
+
+	vk.CmdPipelineBarrier(buffer, {.COLOR_ATTACHMENT_OUTPUT}, {.BOTTOM_OF_PIPE}, nil, 0, nil, 0, nil, 1, &vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		srcAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		newLayout = .PRESENT_SRC_KHR,
+		image = app.swap_chain_images[image_index],
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	})
 }
 
 create_command_buffers :: proc(app: ^Hello_Triangle) {
@@ -1167,86 +1215,6 @@ create_command_pool :: proc(app: ^Hello_Triangle) -> (pool: vk.CommandPool) {
 		panic("Failed to create command pool!")
 	}
 	return
-}
-
-create_frame_buffers :: proc(app: ^Hello_Triangle) {
-	resize(&app.swap_chain_frame_buffers, len(app.swap_chain_image_views))
-	for view, i in app.swap_chain_image_views {
-		attachments := [?]vk.ImageView{view, app.depth_image_view}
-		if result := vk.CreateFramebuffer(app.device, &vk.FramebufferCreateInfo{
-			sType = .FRAMEBUFFER_CREATE_INFO,
-			renderPass = app.render_pass,
-			attachmentCount = u32(len(attachments)),
-			pAttachments = raw_data(attachments[:]),
-			width = app.swap_chain_extent.width,
-			height = app.swap_chain_extent.height,
-			layers = 1,
-		}, nil, &app.swap_chain_frame_buffers[i]); result != .SUCCESS {
-			panic("failed to create framebuffer!")
-		}
-	}
-	return
-}
-
-create_render_pass :: proc(app: ^Hello_Triangle) {
-	color_attachment := vk.AttachmentDescription{
-		format = app.swap_chain_image_format,
-		samples = {._1},
-		loadOp = .CLEAR,
-		storeOp = .STORE,
-		stencilLoadOp = .DONT_CARE,
-		stencilStoreOp = .DONT_CARE,
-		initialLayout = .UNDEFINED,
-		finalLayout = .PRESENT_SRC_KHR,
-	}
-
-	depth_attachment := vk.AttachmentDescription{
-		format = find_depth_format(app),
-		samples = {._1},
-		loadOp = .CLEAR,
-		storeOp = .DONT_CARE,
-		stencilLoadOp = .DONT_CARE,
-		stencilStoreOp = .DONT_CARE,
-		initialLayout = .UNDEFINED,
-		finalLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-	}
-
-	ca_ref := vk.AttachmentReference{
-		attachment = 0,
-		layout = .ATTACHMENT_OPTIMAL,
-	}
-
-	depth_ref := vk.AttachmentReference{
-		attachment = 1,
-		layout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-	}
-
-	subpass := vk.SubpassDescription{
-		pipelineBindPoint = .GRAPHICS,
-		colorAttachmentCount = 1,
-		pColorAttachments = &ca_ref,
-		pDepthStencilAttachment = &depth_ref,
-	}
-
-	attachments := []vk.AttachmentDescription{color_attachment, depth_attachment}
-
-	if result := vk.CreateRenderPass(app.device, &vk.RenderPassCreateInfo{
-		sType = .RENDER_PASS_CREATE_INFO,
-		attachmentCount = u32(len(attachments)),
-		pAttachments = raw_data(attachments),
-		subpassCount = 1,
-		pSubpasses = &subpass,
-		dependencyCount = 1,
-		pDependencies = &vk.SubpassDependency{
-			srcSubpass = vk.SUBPASS_EXTERNAL,
-			dstSubpass = 0,
-			srcStageMask = {.COLOR_ATTACHMENT_OUTPUT, .EARLY_FRAGMENT_TESTS},
-			dstStageMask = {.COLOR_ATTACHMENT_OUTPUT, .EARLY_FRAGMENT_TESTS},
-			dstAccessMask = {.COLOR_ATTACHMENT_WRITE, .DEPTH_STENCIL_ATTACHMENT_WRITE},
-		},
-	}, nil, &app.render_pass); result != .SUCCESS {
-		panic("Could not create render pass")
-	}
 }
 
 create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout, pipeline: vk.Pipeline) {
@@ -1349,6 +1317,8 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 		panic("failed ot create pipeline layout!")
 	}
 
+	depth_format := find_depth_format(app)
+
 	if result := vk.CreateGraphicsPipelines(app.device, {}, 1, &vk.GraphicsPipelineCreateInfo{
 		sType = .GRAPHICS_PIPELINE_CREATE_INFO,
 		stageCount = 2,
@@ -1361,7 +1331,12 @@ create_graphics_pipeline :: proc(app: ^Hello_Triangle) -> (pl: vk.PipelineLayout
 		pColorBlendState = &color_blending,
 		pDynamicState = &dynamic_state,
 		layout = pl,
-		renderPass = app.render_pass,
+		pNext = &vk.PipelineRenderingCreateInfoKHR{
+			sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+			colorAttachmentCount = 1,
+			pColorAttachmentFormats = &app.swap_chain_image_format,
+			depthAttachmentFormat = depth_format,
+		},
 		subpass = 0,
 		basePipelineHandle = {},
 		basePipelineIndex = -1,
@@ -1431,6 +1406,7 @@ create_swap_chain :: proc(app: ^Hello_Triangle) {
 	indices := find_queue_families(app^, app.physical_device)
 	queue_family_indices := [?]u32{indices.graphics_family.(u32), indices.present_family.(u32)}
 
+	assert(queue_family_indices[0] == queue_family_indices[1])
 	if queue_family_indices[0] != queue_family_indices[1] {
 		create_info.imageSharingMode = .CONCURRENT
 		create_info.queueFamilyIndexCount = 2
@@ -1549,6 +1525,10 @@ create_logical_device :: proc(
 		pEnabledFeatures        = &device_features,
 		enabledExtensionCount   = u32(len(device_extensions)),
 		ppEnabledExtensionNames = raw_data(device_extensions),
+		pNext = &vk.PhysicalDeviceDynamicRenderingFeaturesKHR{
+			sType = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+			dynamicRendering = true,
+		},
 	}
 
 	if enable_validation_layers {
@@ -1649,12 +1629,14 @@ find_queue_families :: proc(
 	)
 
 	for queue_family, i in queue_families {
-		if .GRAPHICS in queue_family.queueFlags {
+		_, gf_ok := indices.graphics_family.(u32)
+		if .GRAPHICS in queue_family.queueFlags && !gf_ok {
 			indices.graphics_family = u32(i)
 		}
 		present_support: b32
+		_, pf_ok := indices.present_family.(u32)
 		vk.GetPhysicalDeviceSurfaceSupportKHR(device, u32(i), app.surface, &present_support)
-		if (present_support) {
+		if (present_support && !pf_ok) {
 			indices.present_family = u32(i)
 		}
 	}
@@ -1716,7 +1698,7 @@ create_instance :: proc() -> (instance: vk.Instance, ok := true) {
 		applicationVersion = vk.MAKE_VERSION(1, 0, 0),
 		pEngineName        = "No Engine",
 		engineVersion      = vk.MAKE_VERSION(1, 0, 0),
-		apiVersion         = vk.API_VERSION_1_0,
+		apiVersion         = vk.API_VERSION_1_3,
 	}
 
 	// specifies required extensions. Vulkan requires
@@ -1811,7 +1793,7 @@ make_validation_layers :: proc() -> (result: [dynamic]cstring) {
 }
 
 make_device_extensions :: proc() -> (result: [dynamic]cstring) {
-	append(&result, vk.KHR_SWAPCHAIN_EXTENSION_NAME)
+	append(&result, vk.KHR_SWAPCHAIN_EXTENSION_NAME, vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME, vk.KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME)
 	return
 }
 
