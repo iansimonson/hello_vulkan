@@ -44,7 +44,23 @@ GLFW_FALSE :: 0
 WIDTH :: 800
 HEIGHT :: 600
 
-GOL := [16*16]i32{
+GOL_Vertices := [4]Vec3{
+	{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0},
+}
+
+GOL_Texture_Coords := [4]Vec2{
+	{0, 0}, {1, 0}, {1, 1}, {0, 1},
+}
+
+GOL_Colors := [4]Vec3{
+	{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1},
+}
+
+GOL_Indices := [6]u32{0, 1, 2, 1, 2, 3}
+
+GOL_GRID_SIZE :: 16
+
+GOL_Single := [GOL_GRID_SIZE * GOL_GRID_SIZE]u8{
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -61,4 +77,13 @@ GOL := [16*16]i32{
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+GOL := expand_gol(&GOL_Single)
+
+expand_gol :: proc(g: ^[GOL_GRID_SIZE * GOL_GRID_SIZE]u8) -> (result: [GOL_GRID_SIZE * GOL_GRID_SIZE][3]i32) {
+	for v, i in g {
+		result[i] = i32(v)
+	}
+	return
 }

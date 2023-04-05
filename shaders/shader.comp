@@ -5,15 +5,14 @@ const int rules[18] = int[18](0, 0, 0, 1, 0, 0, 0, 0, 0,
 
 const int GRID_SIZE = 16;
 
-layout(std140, binding = 2) readonly buffer CellsSSBOIn {
-    int cells[];
-} src;
+layout(binding = 2, rgba8) uniform readonly image2D inputCells;
+layout(binding = 3, rgba8) uniform writeonly image2D outputCells;
 
-layout(std140, binding = 3) buffer CellsSSBOOut {
-    int cells[];
-} dst;
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout (local_size_x = 256, local_size_y = 256, local_size_z = 1) in;
+int value_at_pos(ivec2 pos) {
+    return imageLoad(inputCells, pos).r > 0.4 ? 1 : 0;
+}
 
 void get_neighbors(ivec2 pos, inout ivec2 neighbors[8]) {
     neighbors = ivec2[8](
@@ -28,33 +27,35 @@ void get_neighbors(ivec2 pos, inout ivec2 neighbors[8]) {
     );
 }
 
-ivec2 pos_from_index(int index) {
-    return ivec2(index % GRID_SIZE, index / GRID_SIZE);
-}
-
-int index_from_pos(ivec2 pos) {
-    return pos.y * GRID_SIZE + pos.x;
-}
+// ivec2 pos_from_index(int index) {
+//     return ivec2(index % GRID_SIZE, index / GRID_SIZE);
+// }
+// 
+// int index_from_pos(ivec2 pos) {
+//     return pos.y * GRID_SIZE + pos.x;
+// }
 
 void main() {
-    int index = int(gl_GlobalInvocationID.x);
-    ivec2 pos = pos_from_index(index);
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    float pixel = imageLoad(inputCells, pos).r;
     ivec2 neighbors[8];
     get_neighbors(pos, neighbors);
 
     int summed_neighbors = 
-        src.cells[index_from_pos(neighbors[0])] +
-        src.cells[index_from_pos(neighbors[1])] +
-        src.cells[index_from_pos(neighbors[2])] +
-        src.cells[index_from_pos(neighbors[3])] +
-        src.cells[index_from_pos(neighbors[4])] +
-        src.cells[index_from_pos(neighbors[5])] +
-        src.cells[index_from_pos(neighbors[6])] +
-        src.cells[index_from_pos(neighbors[7])];
+        value_at_pos(neighbors[0]) +
+        value_at_pos(neighbors[1]) +
+        value_at_pos(neighbors[2]) +
+        value_at_pos(neighbors[3]) +
+        value_at_pos(neighbors[4]) +
+        value_at_pos(neighbors[5]) +
+        value_at_pos(neighbors[6]) +
+        value_at_pos(neighbors[7]);
 
-    int my_val = src.cells[index];
+    int my_val = value_at_pos(pos);
 
     int rule_value = ((my_val) * 9) + summed_neighbors;
+    float return_value = float(rules[rule_value]);
+    vec4 result = {return_value, return_value, return_value, 1};
 
-    dst.cells[index] = rules[rule_value];
+    imageStore(outputCells, pos, result);
 }

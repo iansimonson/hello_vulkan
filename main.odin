@@ -88,9 +88,12 @@ Hello_Triangle :: struct {
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
 	mip_levels: u32,
-	depth_image, texture_image: vk.Image,
-	depth_image_memory, texture_memory: vk.DeviceMemory,
-	depth_image_view, texture_image_view: vk.ImageView,
+	depth_image: vk.Image,
+	texture_images: [2]vk.Image,
+	depth_image_memory: vk.DeviceMemory,
+	texture_memories: [2]vk.DeviceMemory,
+	depth_image_view: vk.ImageView,
+	texture_image_views: [2]vk.ImageView,
 	texture_sampler: vk.Sampler,
 	everything_buffer: vk.Buffer, // positions, colors, indices
 	everything_memory: vk.DeviceMemory, // positions, colors, indicies
@@ -399,24 +402,28 @@ generate_mipmaps :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Forma
 }
 
 create_texture_image :: proc(app: ^Hello_Triangle) {
-	image := load_image(TEXTURE_PATH)
-	app.mip_levels = u32(image.mip_levels)
-	defer free_image(image)
+	// image := load_image(TEXTURE_PATH)
+	// app.mip_levels = u32(image.mip_levels)
+	// defer free_image(image)
 
-	staging_buffer, staging_memory := create_buffer(app, vk.DeviceSize(len(image.pixels)), {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+	staging_buffer, staging_memory := create_buffer(app, vk.DeviceSize(slice_size(GOL[:])), {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
 
 	data: rawptr
-	vk.MapMemory(app.device, staging_memory, 0, vk.DeviceSize(len(image.pixels)), nil, &data)
-	mem.copy(data, raw_data(image.pixels), len(image.pixels))
+	vk.MapMemory(app.device, staging_memory, 0, vk.DeviceSize(slice_size(GOL[:])), nil, &data)
+	mem.copy(data, raw_data(GOL[:]), slice_size(GOL[:]))
 	vk.UnmapMemory(app.device, staging_memory)
 
-	app.texture_image, app.texture_memory = create_image(app, u32(image.width), u32(image.height), app.mip_levels, .R8G8B8A8_SRGB, .OPTIMAL, {.TRANSFER_SRC, .TRANSFER_DST, .SAMPLED}, {.DEVICE_LOCAL})
+	app.texture_images[0], app.texture_memories[0] = create_image(app, u32(GOL_GRID_SIZE), u32(GOL_GRID_SIZE), 1, .R8G8B8A8_SINT, .OPTIMAL, {.TRANSFER_DST, .SAMPLED, .STORAGE}, {.DEVICE_LOCAL})
+	app.texture_images[1], app.texture_memories[1] = create_image(app, u32(GOL_GRID_SIZE), u32(GOL_GRID_SIZE), 1, .R8G8B8A8_SINT, .OPTIMAL, {.TRANSFER_DST, .SAMPLED, .STORAGE}, {.DEVICE_LOCAL})
 
-	transition_image_layout(app, app.texture_image, .R8G8B8A8_SRGB, .UNDEFINED, .TRANSFER_DST_OPTIMAL, app.mip_levels)
-	copy_buffer_to_image(app, staging_buffer, app.texture_image, u32(image.width), u32(image.height))
-	// transition_image_layout(app, app.texture_image, .R8G8B8A8_SRGB, .TRANSFER_DST_OPTIMAL, .SHADER_READ_ONLY_OPTIMAL, app.mip_levels)
-	generate_mipmaps(app, app.texture_image, .R8G8B8A8_SRGB, image.width, image.height, u32(image.mip_levels))
+	transition_image_layout(app, app.texture_images[0], .R8_SRGB, .UNDEFINED, .TRANSFER_DST_OPTIMAL, 1)
+	copy_buffer_to_image(app, staging_buffer, app.texture_images[0], u32(GOL_GRID_SIZE), u32(GOL_GRID_SIZE))
+	transition_image_layout(app, app.texture_images[0], .R8_SRGB, .TRANSFER_DST_OPTIMAL, .GENERAL, 1)
+	transition_image_layout(app, app.texture_images[1], .R8_SRGB, .UNDEFINED, .TRANSFER_DST_OPTIMAL, 1)
+	copy_buffer_to_image(app, staging_buffer, app.texture_images[1], u32(GOL_GRID_SIZE), u32(GOL_GRID_SIZE))
+	transition_image_layout(app, app.texture_images[1], .R8_SRGB, .TRANSFER_DST_OPTIMAL, .GENERAL, 1)
+	// generate_mipmaps(app, app.texture_image, .R8G8B8A8_SRGB, image.width, image.height, u32(image.mip_levels))
 
 }
 
@@ -459,7 +466,8 @@ destroy_image :: proc(app: Hello_Triangle, image: vk.Image, image_mem: vk.Device
 }
 
 create_texture_image_view :: proc(app: ^Hello_Triangle) {
-	app.texture_image_view = create_image_view(app, app.texture_image, .R8G8B8A8_SRGB, {.COLOR}, app.mip_levels)
+	app.texture_image_views[0] = create_image_view(app, app.texture_images[0], .R8_SRGB, {.COLOR}, 0)
+	app.texture_image_views[1] = create_image_view(app, app.texture_images[1], .R8_SRGB, {.COLOR}, 0)
 }
 
 create_image_view :: proc(app: ^Hello_Triangle, image: vk.Image, format: vk.Format, aspect_flags: vk.ImageAspectFlags, mip_levels: u32) -> (view: vk.ImageView) {
@@ -494,8 +502,8 @@ create_texture_sampler :: proc(app: ^Hello_Triangle) {
 	
 	sampler_info := vk.SamplerCreateInfo{
 		sType = .SAMPLER_CREATE_INFO,
-		magFilter = .LINEAR,
-		minFilter = .LINEAR,
+		magFilter = .NEAREST,
+		minFilter = .NEAREST,
 		addressModeU = .REPEAT,
 		addressModeV = .REPEAT,
 		addressModeW = .REPEAT,
@@ -505,7 +513,7 @@ create_texture_sampler :: proc(app: ^Hello_Triangle) {
 		unnormalizedCoordinates = false,
 		compareEnable = false,
 		compareOp = .ALWAYS,
-		mipmapMode = .LINEAR,
+		mipmapMode = .NEAREST,
 		mipLodBias = 0,
 		minLod = 0,
 		maxLod = 0,
@@ -550,6 +558,8 @@ transition_image_layout :: proc(app: ^Hello_Triangle, image: vk.Image, format: v
 
 		source_stage = {.TRANSFER}
 		destination_stage = {.FRAGMENT_SHADER}
+	} else if old_layout == .TRANSFER_DST_OPTIMAL && new_layout == .GENERAL {
+		
 	} else {
 		panic("unsupported layout transition!")
 	}
@@ -626,11 +636,11 @@ copy_buffer :: proc(app: ^Hello_Triangle, src, dst: vk.Buffer, copy_infos: []vk.
 
 create_full_buffer :: proc(app: ^Hello_Triangle) {
 	// this should be fine since they all have the same alignment
-	position_size, color_size, index_size, texture_size, gol_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:]), size_of(GOL)
-	total_allocation_size := position_size + color_size + index_size + texture_size + gol_size
+	position_size, color_size, index_size, texture_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:])
+	total_allocation_size := position_size + color_size + index_size + texture_size
 
 	fmt.println("FULL ALLOC:", total_allocation_size)
-	app.everything_buffer, app.everything_memory = create_buffer(app, vk.DeviceSize(total_allocation_size), {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER, .STORAGE_BUFFER}, {.DEVICE_LOCAL})
+	app.everything_buffer, app.everything_memory = create_buffer(app, vk.DeviceSize(total_allocation_size), {.TRANSFER_DST, .VERTEX_BUFFER, .INDEX_BUFFER}, {.DEVICE_LOCAL})
 }
 
 slice_size :: proc(s: $T/[]$E) -> int {
@@ -643,34 +653,31 @@ slice_size :: proc(s: $T/[]$E) -> int {
 /// from staging offset to everything buffer offset
 initialize_buffers :: proc(app: ^Hello_Triangle) {
 
-	position_size, color_size, index_size, texture_size, gol_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:]), MAX_FRAMES_IN_FLIGHT * size_of(GOL)
-	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset, staging_gol_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size, position_size + color_size + index_size + texture_size
-	staging_memory_size := position_size + color_size + texture_size + index_size + gol_size
+	position_size, color_size, index_size, texture_size := slice_size(app.render_object.vertices[:]), slice_size(app.render_object.colors[:]), slice_size(app.render_object.indices[:]), slice_size(app.render_object.texture_coords[:])
+	staging_position_offset, staging_color_offset, staging_index_offset, staging_texture_offset := 0, position_size, position_size + color_size, position_size + color_size + index_size
+	staging_memory_size := position_size + color_size + texture_size + index_size
+	fmt.println(staging_memory_size)
 
 	staging_buffer, staging_memory := create_buffer(app, vk.DeviceSize(staging_memory_size), {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
 	defer destroy_buffer(app^, staging_buffer, staging_memory)
 
 	staging_data: rawptr // full data
-	position_data, color_data, index_data, texture_data, gol_data: rawptr // views
+	position_data, color_data, index_data, texture_data: rawptr // views
 
 	vk.MapMemory(app.device, staging_memory, 0, vk.DeviceSize(staging_memory_size), nil, &staging_data)
 	
-	position_data, color_data, index_data, texture_data, gol_data = 
+	position_data, color_data, index_data, texture_data = 
 		rawptr(uintptr(staging_data) + uintptr(staging_position_offset)),
 		rawptr(uintptr(staging_data) + uintptr(staging_color_offset)),
 		rawptr(uintptr(staging_data) + uintptr(staging_index_offset)),
-		rawptr(uintptr(staging_data) + uintptr(staging_texture_offset)),
-		rawptr(uintptr(staging_data) + uintptr(staging_gol_offset))
+		rawptr(uintptr(staging_data) + uintptr(staging_texture_offset))
 	
-	raw_vertices, raw_colors, raw_indices, raw_textures, raw_gol := slice.to_bytes(app.render_object.vertices[:]), slice.to_bytes(app.render_object.colors[:]), slice.to_bytes(app.render_object.indices[:]), slice.to_bytes(app.render_object.texture_coords[:]), slice.to_bytes(GOL[:])
+	raw_vertices, raw_colors, raw_indices, raw_textures := slice.to_bytes(app.render_object.vertices[:]), slice.to_bytes(app.render_object.colors[:]), slice.to_bytes(app.render_object.indices[:]), slice.to_bytes(app.render_object.texture_coords[:])
 	
 	mem.copy(position_data, raw_data(raw_vertices), len(raw_vertices))
 	mem.copy(color_data, raw_data(raw_colors), len(raw_colors))
 	mem.copy(index_data, raw_data(raw_indices), len(raw_indices))
 	mem.copy(texture_data, raw_data(raw_textures), len(raw_textures))
-	for i in 0..<MAX_FRAMES_IN_FLIGHT {
-		mem.copy(rawptr(uintptr(gol_data) + uintptr(i * size_of(GOL))), raw_data(raw_gol), len(raw_gol))
-	}
 	
 	vk.UnmapMemory(app.device, staging_memory)
 
@@ -694,11 +701,6 @@ initialize_buffers :: proc(app: ^Hello_Triangle) {
 			size = vk.DeviceSize(texture_size),
 			srcOffset = vk.DeviceSize(staging_texture_offset),
 			dstOffset = app.render_offsets.texture_coords,
-		},
-		{
-			size = vk.DeviceSize(gol_size),
-			srcOffset = vk.DeviceSize(staging_gol_offset),
-			dstOffset = vk.DeviceSize(staging_gol_offset),
 		},
 	})
 }
@@ -781,7 +783,7 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 				descriptorCount = 1,
 				pImageInfo = &vk.DescriptorImageInfo{
 					imageLayout = .SHADER_READ_ONLY_OPTIMAL,
-					imageView = app.texture_image_view,
+					imageView = app.texture_image_views[i],
 					sampler = app.texture_sampler,
 				},
 			},
@@ -792,10 +794,9 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 				dstArrayElement = 0,
 				descriptorType = .STORAGE_BUFFER,
 				descriptorCount = 1,
-				pBufferInfo = &vk.DescriptorBufferInfo{
-					buffer = app.everything_buffer,
-					offset = app.render_offsets.texture_coords + vk.DeviceSize(slice_size(app.render_object.texture_coords[:])) + vk.DeviceSize(((i - 1) % MAX_FRAMES_IN_FLIGHT) * size_of(GOL)),
-					range = vk.DeviceSize(slice_size(GOL[:])),
+				pImageInfo = &vk.DescriptorImageInfo{
+					imageLayout = .GENERAL,
+					imageView = app.texture_image_views[((i - 1) + MAX_FRAMES_IN_FLIGHT) % MAX_FRAMES_IN_FLIGHT],
 				},
 			},
 			{
@@ -805,10 +806,9 @@ create_descriptor_sets :: proc(app: ^Hello_Triangle) {
 				dstArrayElement = 0,
 				descriptorType = .STORAGE_BUFFER,
 				descriptorCount = 1,
-				pBufferInfo = &vk.DescriptorBufferInfo{
-					buffer = app.everything_buffer,
-					offset = app.render_offsets.texture_coords + vk.DeviceSize(slice_size(app.render_object.texture_coords[:])) + vk.DeviceSize(((i) % MAX_FRAMES_IN_FLIGHT) * size_of(GOL)),
-					range = vk.DeviceSize(slice_size(GOL[:])),
+				pImageInfo = &vk.DescriptorImageInfo{
+					imageLayout = .GENERAL,
+					imageView = app.texture_image_views[i],
 				},
 			},
 		}
@@ -940,7 +940,7 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 
 	update_uniform_buffer(app, app.current_frame)
 
-	if result = vk.QueueSubmit(app.graphics_queue, 1, &vk.SubmitInfo{
+	submit_info := vk.SubmitInfo{
 		sType = .SUBMIT_INFO,
 		waitSemaphoreCount = 1,
 		pWaitSemaphores = &app.image_available_sems[app.current_frame],
@@ -949,7 +949,9 @@ draw_frame :: proc(app: ^Hello_Triangle) {
 		pCommandBuffers = &app.command_buffers[app.current_frame],
 		signalSemaphoreCount = 1,
 		pSignalSemaphores = &app.render_finished_sems[app.current_frame],
-	}, app.inflight_fences[app.current_frame]); result != .SUCCESS {
+	}
+
+	if result = vk.QueueSubmit(app.graphics_queue, 1, &submit_info, app.inflight_fences[app.current_frame]); result != .SUCCESS {
 		fmt.panicf("failed to submit draw command buffer! got=%v", result)
 	}
 
@@ -1035,7 +1037,6 @@ init :: proc() -> (app: ^Hello_Triangle) {
 	create_render_pass(app)
 	create_descriptor_set_layout(app)
 	app.pipeline_layout, app.graphics_pipeline = create_graphics_pipeline(app)
-
 	
 	app.command_pool = create_command_pool(app)
 	create_command_buffers(app)
@@ -1077,8 +1078,12 @@ cleanup :: proc(app: ^Hello_Triangle) {
 
 	defer vk.DestroyPipeline(app.device, app.graphics_pipeline, nil)
 	defer unload_object(app.render_object)
-	defer destroy_image(app^, app.texture_image, app.texture_memory)
-	defer vk.DestroyImageView(app.device, app.texture_image_view, nil)
+	defer {
+		for i in 0..<MAX_FRAMES_IN_FLIGHT {
+			defer destroy_image(app^, app.texture_images[i], app.texture_memories[i])
+			defer vk.DestroyImageView(app.device, app.texture_image_views[i], nil)
+		}
+	}
 	defer vk.DestroySampler(app.device, app.texture_sampler, nil)
 	defer destroy_buffer(app^, app.everything_buffer, app.everything_memory)
 	defer vk.DestroyCommandPool(app.device, app.command_pool, nil)
@@ -1095,17 +1100,29 @@ cleanup :: proc(app: ^Hello_Triangle) {
 }
 
 load_model :: proc(app: ^Hello_Triangle) {
-	model, load_ok := load_object(MODEL_PATH)
-	if !load_ok {
-		panic("Could not load object model")
+	// model, load_ok := load_object(MODEL_PATH)
+	// if !load_ok {
+	// 	panic("Could not load object model")
+	// }
+	app.render_object = Obj{
+		allocator = context.allocator,
+		vertices = slice.to_dynamic(GOL_Vertices[:]),
+		colors = slice.to_dynamic(GOL_Colors[:]),
+		indices = slice.to_dynamic(GOL_Indices[:]),
+		texture_coords = slice.to_dynamic(GOL_Texture_Coords[:]),
 	}
-	app.render_object = model
 	app.render_offsets = {
 		positions = 0,
-		colors = vk.DeviceSize(slice_size(model.vertices[:])),
-		texture_coords = vk.DeviceSize(slice_size(model.vertices[:])) + vk.DeviceSize(slice_size(model.colors[:])),
-		indices = vk.DeviceSize(slice_size(model.vertices[:])) + vk.DeviceSize(slice_size(model.colors[:])) + vk.DeviceSize(slice_size(model.texture_coords[:])),
+		colors = vk.DeviceSize(slice_size(app.render_object.vertices[:])),
+		texture_coords = vk.DeviceSize(slice_size(app.render_object.vertices[:])) + vk.DeviceSize(slice_size(app.render_object.colors[:])),
+		indices = vk.DeviceSize(slice_size(app.render_object.texture_coords[:])) + vk.DeviceSize(slice_size(app.render_object.vertices[:])) + vk.DeviceSize(slice_size(app.render_object.colors[:])),
 	}
+	// app.render_offsets = {
+	// 	positions = 0,
+	// 	colors = vk.DeviceSize(slice_size(model.vertices[:])),
+	// 	texture_coords = vk.DeviceSize(slice_size(model.vertices[:])) + vk.DeviceSize(slice_size(model.colors[:])),
+	// 	indices = vk.DeviceSize(slice_size(model.vertices[:])) + vk.DeviceSize(slice_size(model.colors[:])) + vk.DeviceSize(slice_size(model.texture_coords[:])),
+	// }
 }
 
 create_sync_objects :: proc(app: ^Hello_Triangle) {
@@ -1130,6 +1147,7 @@ create_sync_objects :: proc(app: ^Hello_Triangle) {
 record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, image_index: int) {
 	if vk.BeginCommandBuffer(buffer, &vk.CommandBufferBeginInfo{
 		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.SIMULTANEOUS_USE},
 	}) != .SUCCESS {
 		panic("Could not begin recording command buffer!")
 	}
@@ -1158,7 +1176,6 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 		clearValueCount = u32(len(clear_values)),
 		pClearValues = raw_data(clear_values),
 	}, .INLINE)
-	defer vk.CmdEndRenderPass(buffer)
 
 	vk.CmdSetViewport(buffer, 0, 1, &vk.Viewport{
 		width = f32(app.swap_chain_extent.width),
@@ -1178,6 +1195,11 @@ record_command_buffer :: proc(app: ^Hello_Triangle, buffer: vk.CommandBuffer, im
 	vk.CmdBindIndexBuffer(buffer, index_buffer, app.render_offsets.indices, .UINT32)
 	vk.CmdBindDescriptorSets(buffer, .GRAPHICS, app.pipeline_layout, 0, 1, &app.descriptor_sets[app.current_frame], 0, nil)
 	vk.CmdDrawIndexed(buffer, u32(len(app.render_object.indices)), 1, 0, 0, 0)
+	vk.CmdEndRenderPass(buffer)
+
+	vk.CmdBindPipeline(buffer, .COMPUTE, app.graphics_pipeline)
+	vk.CmdBindDescriptorSets(buffer, .COMPUTE, app.pipeline_layout, 0, 1, &app.descriptor_sets[app.current_frame], 0, nil)
+	vk.CmdDispatch(buffer, GOL_GRID_SIZE, GOL_GRID_SIZE, 1)
 
 }
 
@@ -1474,7 +1496,7 @@ create_swap_chain :: proc(app: ^Hello_Triangle) {
 	}
 
 	indices := find_queue_families(app^, app.physical_device)
-	queue_family_indices := [?]u32{indices.graphics_family.(u32), indices.present_family.(u32)}
+	queue_family_indices := [?]u32{indices.graphics_and_compute_family.(u32), indices.present_family.(u32)}
 
 	if queue_family_indices[0] != queue_family_indices[1] {
 		create_info.imageSharingMode = .CONCURRENT
@@ -1564,7 +1586,7 @@ create_logical_device :: proc(
 	queue_set := make(map[u32]u32)
 	defer delete(queue_set)
 	queue_set[indices.graphics_and_compute_family.(u32)] = 1
-	queue_set[indices.graphics_family.(u32)] = 1
+	// queue_set[indices.graphics_family.(u32)] = 1
 	queue_set[indices.present_family.(u32)] = 1
 
 	queue_priority: f32 = 1.0
@@ -1674,8 +1696,9 @@ Queue_Family_Indices :: struct {
 
 is_complete :: proc(indices: Queue_Family_Indices) -> bool {
 	_, has_graphics := indices.graphics_family.(u32)
+	_, has_graphics_and_compute := indices.graphics_and_compute_family.(u32)
 	_, has_present := indices.present_family.(u32)
-	return has_graphics && has_present
+	return (has_graphics || has_graphics_and_compute) && has_present
 }
 
 find_queue_families :: proc(
