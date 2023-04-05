@@ -47,6 +47,8 @@ main :: proc() {
 		&extension_count,
 		raw_data(extension_list),
 	)
+	fmt.println("INSTANCE EXTENSIONS:")
+	fmt.println("====================")
 	for ext in &extension_list {
 		fmt.println(
 			"name",
@@ -54,6 +56,18 @@ main :: proc() {
 			"version",
 			ext.specVersion,
 		)
+	}
+
+	device_extension_count: u32
+	vk.EnumerateDeviceExtensionProperties(app.physical_device, nil, &device_extension_count, nil)
+	device_extension_list := make([dynamic]vk.ExtensionProperties, device_extension_count)
+	defer delete(device_extension_list)
+	vk.EnumerateDeviceExtensionProperties(app.physical_device, nil, &device_extension_count, raw_data(device_extension_list[:]))
+
+	fmt.println("DEVICE EXTENSIONS:")
+	fmt.println("====================")
+	for ext in &device_extension_list {
+		fmt.println("name", transmute(cstring) raw_data(ext.extensionName[:]), "version", ext.specVersion)
 	}
 
 	t := thread.create(proc(t: ^thread.Thread){
